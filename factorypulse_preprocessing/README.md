@@ -1,104 +1,99 @@
-# FactoryPulse 前處理程式碼
+# FactoryPulse
 
-資料集：*Vibration, Acoustic, Temperature, and Motor Current Dataset of Rotating
-Machine Under Varying Load Conditions for Fault Diagnosis*（KAIST, Mendeley DOI
-10.17632/ztmf3m7h5x, **CC BY 4.0** — 記得在簡報 / 報告附錄引用這篇）。
+多感測器旋轉機械故障診斷平台 — 結合振動、電流、溫度三模態特徵、XGBoost 分類與規則引擎融合，並以 LLM 產生可解釋的維修建議。
 
-## 我幫你檢查過你資料夾裡的實際狀況
+以 [KAIST/Hyundai 旋轉機械資料集](https://data.mendeley.com/datasets/ztmf3m7h5x)（Vibration, Acoustic, Temperature, and Motor Current Dataset of Rotating Machine Under Varying Load Conditions for Fault Diagnosis, CC BY 4.0）為基礎驗證。
 
-- `vibration/`：45 個檔案（3 負載 × 15 種條件），OK。
-- `current,temp/`：45 個檔案，OK。
-- `acoustic/`：**只有 5 個檔案**（`0Nm_BPFI_03/10`, `0Nm_BPFO_03/10`, `0Nm_Normal`），
-  缺了 `0Nm_BPFO_30`、所有 `Misalign`、所有 `Unbalance`，以及全部 `2Nm`/`4Nm`。
-  **這個要先回 Mendeley 資料集頁面確認是不是分成多個 part，把剩下的補齊**，
-  不然聲音模型只能做「0Nm 下 BPFI vs BPFO vs Normal」三分類，會拖累整個多感測
-  融合 demo 的完整度。
-- 振動檔名有個原始資料集本身的拼字錯誤：`2Nm` 資料夾裡 `Unbalance` 被打成
-  `Unbalalnce`（`current,temp/` 裡對應檔案拼字是對的）。已經在
-  `label_utils.py` 和 `build_dataset.py` 的比對邏輯裡處理掉了，不用手動改檔名。
-- 檔案都是 MATLAB v5 格式（`scipy.io.loadmat` 讀得動）、TDMS 是 NI FlexLogger
-  格式（`nptdms` 讀得動），格式本身沒問題。
+## 核心理念
 
-## 安裝
+分類器只回答「是什麼故障、多確定」，不回答「多嚴重、要不要停機」——這兩件事被拆成兩層，避免黑盒模型把診斷跟決策混在一起：
 
-沙盒環境沒有對外網路，沒辦法在這裡直接跑，**請在你自己的電腦或 Colab 執行**：
+- **模型層**：各感測模態各自訓練 XGBoost，輸出故障類別與異常機率
+- **規則層**：跨感測交叉驗證、風險分級、是否停機，全部是可追溯的門檻邏輯，不是模型學出來的
+- **語言層**：LLM 只負責把結構化診斷結果轉成人看得懂的文字，禁止自行編造診斷內容
 
-```bash
-pip install -r requirements.txt
+每一個結論都能回溯到具體的物理量測（例如包絡譜在軸承特徵頻率的能量、相對正常基準的溫差倍數），而不只是一個信心分數。
+
+## 系統流程
+
+### 1. 離線訓練 pipeline
+
+```mermaid
+flowchart TD
+    A1[振動原始訊號<br/>45 個 .mat 檔案] --> B[build_dataset.py<br/>去偏移・切窗・算特徵]
+    A2[電流＋溫度訊號<br/>45 個 .tdms 檔案] --> B
+    B --> C1[振動特徵 CSV<br/>RMS・峰度・包絡譜]
+    B --> C2[電流特徵 CSV<br/>MCSA・三相不平衡]
+    B --> C3[溫度特徵 CSV<br/>相對基準溫差]
+    C1 --> D[train_baseline.py 等<br/>依模式訓練 XGBoost]
+    C2 --> D
+    C3 --> D
+    D --> E[model_*.pkl<br/>振動／電流／融合模型]
 ```
 
-## 執行順序
+原始訊號先做包絡解調，鎖定軸承內外環特徵頻率（BPFO 183.5 Hz / BPFI 268.8 Hz）與轉頻諧波（1x 50.2 Hz、3x 150.4 Hz）的譜線強度，特徵本身就對應已知的故障機制，不是丟一堆統計量讓模型硬學。
 
-1. **先跑一次 `inspect_tdms.py`**，核對電流/溫度欄位名稱：
+### 2. 執行期診斷流程
 
-   ```bash
-   python inspect_tdms.py "acoustic_temp_vibration/current,temp/0Nm_Normal.tdms"
-   ```
+```mermaid
+flowchart TD
+    F1[廠內模擬訊號<br/>factory_sim 逐分鐘取樣] --> G[dashboard_data.diagnose&#40;&#41;<br/>載入模型並執行推論]
+    F2[使用者上傳檔案<br/>.mat / .tdms / .csv] --> G
+    G --> H1[振動模型<br/>XGBoost，5 類分類]
+    G --> H2[電流模型<br/>XGBoost，5 類分類]
+    G --> H3[溫度趨勢<br/>不分類，只判斷惡化]
+    H1 --> I[rule_engine 加權融合<br/>振動 65%・電流 25%・溫度 10%]
+    H2 --> I
+    H3 --> I
+    I --> J1[knowledge_base<br/>原因・檢查・建議行動]
+    I --> J2[evidence.py<br/>比對正常基準倍數]
+    J1 --> K[llm_assistant.py<br/>生成可解釋文字說明]
+    J2 --> K
+    K --> L1[廠區總覽]
+    K --> L2[設備診斷]
+    K --> L3[多感測證據]
+    K --> L4[即時診斷]
+```
 
-   我在沙盒裡只能用 `strings` 粗略看到 header 裡有 `Temperature`、
-   `NI_CjcTemperature`、`Current`、`Voltage` 這些關鍵字，沒辦法確認完整的
-   group/channel 樹狀結構長怎樣。`io_utils.py` 裡的欄位比對是「保守模糊比對」，
-   如果報錯说找不到某個欄位，把這支腳本印出來的實際名稱貼給我，我再幫你調整
-   `io_utils.py` 裡的判斷邏輯。
+溫度不參與故障分類（樣本量太少，直接訓練會有標籤洩漏風險），只用來判斷異常是否持續惡化、要不要提升處理急迫度。
 
-2. 把 `config.py` 裡的 `DATA_ROOT` 改成你資料實際的路徑。
+## 兩種運轉模式
 
-3. 跑主流程：
+| 模式 | 資料集 | 故障類別 | 感測來源 | 模型架構 |
+|---|---|---|---|---|
+| 定轉速・變負載 | 3010 RPM，0/2/4 Nm | 正常／內圈／外圈／不對心／不平衡（5 類） | 振動＋電流＋溫度 | 振動、電流各自獨立模型，可跨感測交叉驗證 |
+| 變轉速 | 618~2480 RPM 連續變化 | 正常／內圈／外圈／滾動體（4 類） | 振動＋電流 | 振動＋電流合併輸入的單一融合模型，沒有溫度資料 |
 
-   ```bash
-   python build_dataset.py                    # 處理振動/電流/溫度三個模態（預設不含聲音）
-   python build_dataset.py --include-acoustic  # 聲音資料補齊到 45 個檔案後才加這個 flag
-   ```
+## 儀表板頁面
 
-   目前決定先不做聲音模型（見下方「關於拿掉聲音模態」），所以預設行為已經改成
-   **不處理聲音**，不用每次都手動加 `--skip-acoustic`。
+- **廠區總覽**：10 台同型 CNC 的廠房佈局與健康狀態，每分鐘更新
+- **設備診斷**：單一機台的完整診斷結果與建議行動
+- **多感測證據**：AI 判斷依據的可解釋性展示（物理證據、模型投票分布、特徵重要度）
+- **即時診斷**：上傳原始感測檔（.mat / .tdms / .csv），系統自動轉檔並診斷
 
-4. 輸出會在 `processed/` 資料夾：
+## 已知限制
 
-   - `manifest.csv`：每個檔案的標籤（load / condition / severity / severity_level）
-   - `vibration_windows_{train,val,test}.npz`：1D CNN 用的原始波形
-   - `vibration_features_{split}.csv`：手工特徵（RMS/峰值因子/頻帶能量...），
-     可以先拿去跑 RandomForest/XGBoost 當 baseline，比等 CNN 訓練好快很多
-   - `current_features_{split}.csv`：三相電流 MCSA 特徵（含三相不平衡度）
-   - `temperature_features_{split}.csv`：溫度趨勢特徵（已經用同負載下的 Normal
-     檔案算出 baseline 溫度）
-   - `acoustic_specs_{split}.npz`：mel spectrogram，給 2D CNN（若聲音檔齊全）
+- 聲音（acoustic）模態因資料量不足（45 個檔案中只有 5 個）已從系統中移除，列為未來擴充方向
+- 溫度門檻是用本資料集 60~300 秒的錄音校出來的，實際部署時須用設備自身的長期資料重新校正
+- 不對心（Misalign）與不平衡（Unbalance）在跨負載測試中容易互相混淆，系統會主動揭露此辨識限制而非隱藏
 
-## 為什麼 train/val/test 是「同一檔案內部按時間切」，不是「整個檔案分組」
+## 執行方式
 
-這組資料每個 (load, condition, severity) 只有一個檔案，如果直接把整個檔案分去
-train 或 test，某些故障類別會完全不在訓練集裡，或完全不在測試集裡。所以
-`build_dataset.py` 對每個檔案的訊號依時間順序切成前 70%(train) / 中間
-15%(val) / 後 15%(test)，切窗完全在各自的時間區段內進行，不會有同一段訊號的
-窗同時出現在不同 split。
+```bash
+cd factorypulse_preprocessing
+pip install -r requirements.txt
 
-如果之後想做「跨負載泛化測試」（例如 0Nm/2Nm 訓練、4Nm 測試，驗證模型不是
-背答案），可以另外寫一個 `split_by_load()`（我可以幫你加），這個對評審來說是
-很有說服力的實驗設計，回應「你們是不是資料洩漏」的質疑。
+# 1. 前處理：從原始感測檔產生特徵 CSV
+python build_dataset.py
 
-## 關於拿掉聲音模態
+# 2. 訓練模型
+python train_baseline.py     # 定轉速・變負載模式
+python train_speed.py        # 變轉速模式
 
-聲音資料只有 5/45 個檔案（0Nm 下 BPFI/BPFO/Normal），資料量太少，不足以支撐一個
-獨立訓練/驗證的模型，決定先不做。對應的調整：
+# 3. 啟動儀表板
+streamlit run app.py
+```
 
-- `build_dataset.py` 預設不處理聲音（`--include-acoustic` 才會打開），
-  `features_acoustic.py` 保留著沒刪，之後資料補齊隨時可以接回來。
-- 系統從「四模態融合」改成「三模態融合：振動 + 電流 + 溫度」，GPT 原稿裡聲音
-  20~30% 的權重要重新分配（建議：振動 55~65% / 電流 20~25% / 溫度 10~15%，
-  維持振動仍是主要診斷來源的邏輯不變）。
-- 規則引擎裡跟聲音有關的規則（例如「振動與聲音同時異常」「只有聲音異常→環境
-  噪音」）要拿掉或改寫成只用振動+電流+溫度的組合。
-- 簡報/提案文件裡如果還留著「聲音模型」的描述，建議改成「聲音偵測列為未來擴充
-  方向，目前驗證資料量不足」，這樣講反而顯得工程判斷紮實，比硬做一個資料量
-  不夠、demo 時容易被問倒的模型更安全。
+## 資料來源
 
-## 已知限制 / 下一步
-
-- 這邊的 sandbox 沒有對外網路，`scipy`/`nptdms`/`librosa` 都裝不了，所以
-  `io_utils.load_vibration_mat` 等實際讀檔的函式**沒有在真實資料上跑過**，
-  只驗證過：檔名解析（`label_utils.py`）、切窗與時間切分（`windowing.py`）、
-  以及振動/電流/溫度的特徵計算邏輯（用合成訊號驗證數值方向正確，例如
-  「有週期性衝擊的假訊號」峰值因子與高頻能量確實比正常訊號高）。
-- 第一次在你自己的環境跑完，如果哪一步報錯，把錯誤訊息貼給我，我可以直接對症
-  下藥修 `io_utils.py`（最可能出錯的就是 tdms 的欄位比對，因為我看不到完整
-  channel 清單）。
+*Vibration, Acoustic, Temperature, and Motor Current Dataset of Rotating Machine Under Varying Load Conditions for Fault Diagnosis*，KAIST，Mendeley Data, DOI: 10.17632/ztmf3m7h5x，CC BY 4.0。
