@@ -24,7 +24,7 @@ import pandas as pd
 
 import config
 
-MODELS_DIR = Path("./models")
+MODELS_DIR = Path(__file__).parent / "models"
 
 MODE_LABELS = {
     "load": "定轉速・變負載",

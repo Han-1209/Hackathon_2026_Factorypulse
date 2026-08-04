@@ -31,7 +31,7 @@ VIBRATION_DIR = DATA_ROOT / "vibration"
 ACOUSTIC_DIR = DATA_ROOT / "acoustic"
 CURRENT_TEMP_DIR = DATA_ROOT / "current,temp"
 
-OUTPUT_DIR = Path("./processed")
+OUTPUT_DIR = Path(__file__).parent / "processed"
 
 # ---- 取樣率（依論文 / Mendeley 說明）----
 VIBRATION_FS = 25600      # Hz
@@ -98,7 +98,7 @@ SPEED_ZIPS = [
     ) / "part3.zip",
 ]
 
-SPEED_OUTPUT_DIR = Path("./processed_speed")
+SPEED_OUTPUT_DIR = Path(__file__).parent / "processed_speed"
 
 SPEED_RECORD_SEC = 300.0       # 每個檔案的錄音長度（由 rpm 檔的 time 欄位確認）
 

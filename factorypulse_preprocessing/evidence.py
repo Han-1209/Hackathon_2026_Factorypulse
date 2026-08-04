@@ -37,7 +37,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-REFERENCE_PATH = Path("./results/evidence_reference.json")
+REFERENCE_PATH = Path(__file__).parent / "results" / "evidence_reference.json"
 
 # ---------------------------------------------------------------------------
 # 特徵 -> (顯示名稱, 物理意義, 異常方向)
