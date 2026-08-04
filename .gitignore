@@ -1,0 +1,37 @@
+# ===== Secrets & API Keys =====
+.streamlit/secrets.toml
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# ===== Virtual Environments =====
+venv/
+.venv/
+env/
+
+# ===== IDE / Editor =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Trash =====
+_trash_*/
+
+# ===== Raw datasets =====
+Subset1/
+Subset2/
+Subset3/
+acoustic_temp_vibration/

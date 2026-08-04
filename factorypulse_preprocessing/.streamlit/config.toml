@@ -1,0 +1,13 @@
+# 戰情室深色主題。
+# 這裡設定的是 Streamlit 內建元件（按鈕、選單、表格）的底色，
+# 自訂區塊的樣式在 ui_theme.py 裡用 CSS 控制，兩者色票要一致。
+[theme]
+base = "dark"
+primaryColor = "#22d3ee"
+backgroundColor = "#070d18"
+secondaryBackgroundColor = "#0d1626"
+textColor = "#dbeafe"
+
+[server]
+# 讓同一個區網的人也能用 Network URL 連進來（demo 現場很實用）
+headless = true

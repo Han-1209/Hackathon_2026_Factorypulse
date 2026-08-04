@@ -1,0 +1,10 @@
+﻿feature,importance
+load_nm,0.58884
+current_rms,0.15087
+current_envelope_dom_freq,0.08575
+current_kurtosis,0.05882
+current_envelope_cv,0.03638
+current_harmonic_energy,0.02929
+current_peak,0.01964
+current_crest_factor,0.0161
+current_sideband_ratio,0.01432

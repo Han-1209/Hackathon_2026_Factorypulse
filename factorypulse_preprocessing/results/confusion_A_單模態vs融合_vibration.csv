@@ -1,0 +1,6 @@
+﻿,BPFI,BPFO,Misalign,Normal,Unbalance
+BPFI,153,0,0,0,0
+BPFO,0,153,0,0,0
+Misalign,0,0,315,0,0
+Normal,0,0,0,141,18
+Unbalance,0,0,0,31,494

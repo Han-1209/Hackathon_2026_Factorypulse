@@ -1,0 +1,9 @@
+numpy
+pandas
+scipy
+nptdms
+librosa
+scikit-learn
+xgboost
+streamlit
+google-genai
