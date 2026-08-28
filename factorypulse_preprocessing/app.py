@@ -15,6 +15,8 @@ FactoryPulse 儀表板
 """
 
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import llm_assistant as llm_mod
 
@@ -157,7 +159,7 @@ if page == "廠區總覽":
             st.cache_data.clear()
             st.rerun()
 
-    clock = time.strftime("%Y-%m-%d %H:%M:%S")
+    clock = datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S")
     st.markdown(
         T.command_bar(
             "FACTORYPULSE 戰情室",
