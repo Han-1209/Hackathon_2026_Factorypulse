@@ -6,4 +6,5 @@ librosa
 scikit-learn
 xgboost
 streamlit
+altair
 google-genai

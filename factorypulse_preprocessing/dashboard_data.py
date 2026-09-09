@@ -79,6 +79,61 @@ def fault_display(name: str) -> str:
     return FAULT_DISPLAY.get(name, name)
 
 
+# ---------------------------------------------------------------- LOLO 模型
+# leave-one-load-out：每個模型都排除一個負載，儀表板上每台機台改用
+# 「沒看過它那個負載」的那一個。理由見 train_lolo.py 的說明——
+# 原本上線的 model_vibration.pkl 是同錄音切分訓練的，那組數字《數字口徑表》
+# 明文不可對外引用，但畫面上一直在用它。
+LOLO_TAG = {"vibration": "vib", "current": "cur"}
+
+# 二元 AUC（正常 vs 有故障）低於此值，視為這個模態「跨負載不成立」，
+# 不讓它參與風險計算。必須與 train_lolo.USABLE_MIN_AUC 一致。
+#
+# ⚠️ 這條門檻是為了電流模態存在的，實測結果：
+#     排除 0Nm  逐窗 AUC 0.438     排除 2Nm  0.535     排除 4Nm  0.606
+# 也就是換到沒看過的負載，電流模型判斷「有沒有故障」等同亂猜。
+# 原因不難理解：去掉有量綱特徵後電流只剩 7 個無量綱特徵，
+# 而電流的訊號幅度本來就由負載主導，跨負載等於把唯一的資訊來源抽掉。
+# 這與《數字口徑表》「融合電流沒有提升準確率」是同一件事的量化版本。
+#
+# 不擋掉的話後果很具體：電流模型對正常機台也給出 0.985 的異常機率，
+# 規則引擎 R1「振動與電流同時異常」會對每一台都成立，風險分數整片虛高。
+USABLE_MIN_AUC = 0.70
+
+
+@lru_cache(maxsize=16)
+def load_lolo(modality: str, held_out_load: int) -> dict | None:
+    """載入排除某個負載的模型。找不到就回 None，讓呼叫端退回原模型。"""
+    tag = LOLO_TAG.get(modality)
+    if tag is None:
+        return None
+    path = MODELS_DIR / f"model_{tag}_lolo_{int(held_out_load)}.pkl"
+    if not path.exists():
+        return None
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+@lru_cache(maxsize=1)
+def lolo_available() -> bool:
+    """三個負載的振動模型是否都齊了。畫面用它決定要不要顯示警告橫幅。"""
+    return all(load_lolo("vibration", l) is not None for l in (0, 2, 4))
+
+
+def load_model_for(mode: str, modality: str, load_nm: float | None = None) -> dict:
+    """取得該用哪個模型。
+
+    變負載模式且該負載有對應的 LOLO 模型時優先用它（模型沒看過這個負載）；
+    否則退回原本的模型，並在 bundle 裡標記 held_out_load=None，
+    讓畫面可以誠實顯示「這個結果來自看過同錄音的模型」。
+    """
+    if mode == "load" and load_nm is not None:
+        bundle = load_lolo(modality, int(round(load_nm)))
+        if bundle is not None:
+            return bundle
+    return load_model(mode, modality)
+
+
 @lru_cache(maxsize=8)
 def load_model(mode: str, modality: str) -> dict:
     fname = MODE_SPEC[mode]["models"].get(modality)
@@ -332,14 +387,32 @@ def build_llm_diag(mode: str, res: dict, X: pd.DataFrame) -> dict:
     }
 
     diag["evidence"] = []
+    diag["severity_series"] = None
+    has_baseline = False
     if mode == "load":     # 理由同 diagnose()：基準檔只適用變負載資料集
         try:
             import evidence
+            evidence.load_reference()
+            has_baseline = True
             diag["evidence"] = evidence.extract(diag["evidence_features"],
                                                 load_nm=load_nm, top=5,
                                                 fault_type=fault)
+            diag["severity_series"] = evidence.severity_series(
+                X, load_nm=load_nm, fault_type=fault)
         except (FileNotFoundError, ImportError):
             pass
+
+    # 信心度與「設備診斷」頁走同一套判定，避免同一台機器在兩頁看到不同等級
+    import confidence as _cf
+    diag["confidence_verdict"] = _cf.assess(
+        evidence=diag["evidence"],
+        fault_type=fault,
+        agreement=float(res.get("confidence", 0.0)),
+        n_windows=int(res.get("n_windows", 0)),
+        cross_sensor=None,      # 上傳的檔案只有單一模態
+        known_confusion=info.get("known_confusion", ""),
+        has_physical_baseline=has_baseline,
+    )
     return diag
 
 
@@ -378,6 +451,10 @@ def diagnose(mode: str, file_id: str, split: str = "test",
     cond_value = None
     vib_features = None      # 給證據層算「幾倍於正常」用
 
+    vib_frame = None         # 逐窗特徵表，給物理嚴重度趨勢圖用
+    model_scope = {}         # 每個模態實際用了哪個模型（沒看過哪個負載）
+    unusable = {}            # 跨負載驗證不通過的模態 -> 它的 AUC
+
     for modality in spec["models"]:
         X, y, meta = split_features(mode, modality, split)
         mask = (meta.file_id == file_id).values
@@ -388,27 +465,43 @@ def diagnose(mode: str, file_id: str, split: str = "test",
             from factory_sim import observation_slice
             idx = observation_slice(len(Xf), window_minute)
             Xf = Xf.iloc[idx]
-        detail[modality] = infer_modality(load_model(mode, modality), Xf)
-        # 振動（或融合模型，它也含振動欄位）的特徵中位數 -> 證據層的輸入。
-        # 用中位數而非平均，理由同 infer_modality：對瞬間干擾的窗比較穩。
-        if modality in ("vibration", "fused"):
-            vib_features = Xf.median(numeric_only=True).to_dict()
+
         truth = y[mask].iloc[0]
         cond_col = spec["condition_col"]
         if cond_col in meta.columns:
             cond_value = float(meta.loc[mask, cond_col].mean())
+
+        # ⚠️ 模型要先知道負載才能挑：這台機台的診斷必須由「沒看過這個負載」
+        # 的模型做出來，否則畫面上的數字就是《數字口徑表》禁止對外的那一類。
+        bundle = load_model_for(mode, modality, cond_value)
+        model_scope[modality] = bundle.get("held_out_load")
+        detail[modality] = infer_modality(bundle, Xf)
+
+        # 跨負載站不住腳的模態，只留著顯示，不讓它進風險計算（見 USABLE_MIN_AUC）
+        auc = bundle.get("holdout_auc")
+        if auc is not None and auc < USABLE_MIN_AUC:
+            unusable[modality] = auc
+
+        # 振動（或融合模型，它也含振動欄位）的特徵中位數 -> 證據層的輸入。
+        # 用中位數而非平均，理由同 infer_modality：對瞬間干擾的窗比較穩。
+        if modality in ("vibration", "fused"):
+            vib_features = Xf.median(numeric_only=True).to_dict()
+            vib_frame = Xf
 
     # 兩種模式的模型組成不同，這裡統一成規則引擎要的介面：
     #   load  : vibration + current 兩個獨立模型，可做跨感測交叉驗證
     #   speed : 單一融合模型（振動+電流一起輸入），無法拆出各感測器的獨立意見，
     #           所以交叉驗證那幾條規則在這個模式下不會有實質作用——
     #           畫面上會標明「單一融合模型」，不假裝有兩個獨立判斷。
+    current_usable = "current" in detail and "current" not in unusable
     if "fused" in detail:
         vib = cur = detail["fused"]
         primary_key = "fused"
     else:
         vib = detail["vibration"]
-        cur = detail.get("current", vib)
+        # 電流跨負載不成立時，用振動的結果代入 —— 規則引擎的介面需要兩個輸入，
+        # 但不能拿一個等同亂猜的訊號去觸發「兩來源同時異常」那類規則。
+        cur = detail["current"] if current_usable else vib
         primary_key = "vibration"
 
     delta, slope = get_temperature(mode, file_id, split)
@@ -417,6 +510,7 @@ def diagnose(mode: str, file_id: str, split: str = "test",
         current=ModalityInput(cur["anomaly_prob"], cur["fault_type"], cur["confidence"]),
         temperature=TemperatureInput(delta, slope),
         load_nm=cond_value,
+        use_current=current_usable,
     )
 
     out = d.to_dict()
@@ -425,9 +519,11 @@ def diagnose(mode: str, file_id: str, split: str = "test",
     # 規則引擎為了介面一致，在缺電流時用振動結果代入、缺溫度時當作 0，
     # 那些是計算用的後備值，不是真的量到的東西——直接顯示會讓使用者以為
     # 系統量了電流與溫度。畫面上寧可少一項，也不要給看似有意義的假數字。
-    if "current" not in detail:
-        # 融合模型的輸入已經含電流，但它給不出「電流自己的意見」，
-        # 所以「負載健康」這個分項在該模式下沒有獨立意義，不顯示。
+    if not current_usable:
+        # 兩種情況都會走到這裡：
+        #   1. 融合模型 —— 輸入含電流，但給不出「電流自己的意見」
+        #   2. 電流模型跨負載不成立（AUC < USABLE_MIN_AUC）
+        # 兩種情況下「負載健康」都不是獨立量到的東西，顯示它等於給假數字。
         out["health_scores"].pop("負載健康", None)
     if not spec["has_temperature"]:
         out["health_scores"].pop("熱狀態", None)
@@ -437,7 +533,7 @@ def diagnose(mode: str, file_id: str, split: str = "test",
     if primary_key == "fused":
         sensors = ["振動", "電流"]
     else:
-        sensors = ["振動"] + (["電流"] if "current" in detail else [])
+        sensors = ["振動"] + (["電流"] if current_usable else [])
     if spec["has_temperature"]:
         sensors.append("溫度")
 
@@ -462,10 +558,21 @@ def diagnose(mode: str, file_id: str, split: str = "test",
                     f"此架構下無法拆出各感測器的獨立意見，故不做跨感測交叉驗證。",
         }]
 
-    # 依嚴重度調整故障措辭（見 contextual_fault 的說明）
-    ctx_label, ctx_note = contextual_fault(
-        d.probable_fault_display, d.risk_score, d.probable_fault == "Normal"
-    )
+    # 電流跨負載不成立時改寫證據表那一列。不改的話畫面會列出
+    # 「電流・高異常・異常機率 0.99」——那個數字在沒看過的負載上等同亂猜，
+    # 留著會變成一條看似有力、實際無效的證據。
+    if not current_usable and "current" in unusable:
+        auc = unusable["current"]
+        for row in out["evidence"]:
+            if row.get("來源") == "電流":
+                row.update({
+                    "狀態": "跨負載不成立",
+                    "數值": f"二元 AUC {auc:.2f}",
+                    "說明": (f"電流模型在沒看過的負載上，判斷「有沒有故障」的 AUC 只有 "
+                             f"{auc:.2f}（0.5 等同亂猜），因此本次不讓它參與風險計算。"
+                             f"去掉有量綱特徵後電流只剩 7 個無量綱特徵，"
+                             f"而電流幅度本來就由負載主導。"),
+                })
 
     # ---- 物理證據：實際量到的數值 vs 同負載正常基準 ----
     # 「多感測證據」頁的核心。上面 out["evidence"] 是各感測來源的異常機率
@@ -481,16 +588,64 @@ def diagnose(mode: str, file_id: str, split: str = "test",
     #   2. 兩個資料集的機台、感測器配置都不同，數值本來就不可比
     #      （而 ch0_kurtosis 這類欄位剛好兩邊都有，會靜靜算出一個看似合理的倍數）
     # 與其顯示一個錯的數字，不如不顯示。
+    out["severity_series"] = None
+    has_baseline = False
     if mode == "load":
         try:
             import evidence as _ev
+            _ev.load_reference()          # 取不到基準檔就不宣稱做過物理驗證
+            has_baseline = True
             out["physical_evidence"] = _ev.extract(
                 vib_features or {}, load_nm=cond_value or 0.0, top=5,
                 fault_type=d.probable_fault)
+            # 逐窗物理嚴重度：趨勢圖的主線。分類器機率是決策不是量測，
+            # 在明確樣本上會飽和成一條水平線（見 evidence.severity_series）。
+            if vib_frame is not None:
+                out["severity_series"] = _ev.severity_series(
+                    vib_frame, load_nm=cond_value or 0.0,
+                    fault_type=d.probable_fault)
         except (FileNotFoundError, ImportError):
             pass
 
+    # ---- 物理閘門：先偵測再診斷 ----
+    # 物理層說「各項都在基準內」時，推翻分類器的故障結論（見 _apply_physical_gate）。
+    # 順序很重要：閘門必須在 contextual_fault 與信心度之前，
+    # 否則畫面上的措辭與信心度仍然依據被推翻的那個結論算出來。
+    out["gate_overrode"] = None
+    gate = "unknown"
+    if mode == "load":
+        gate = _apply_physical_gate(out, d, out["physical_evidence"])
+    out["physical_gate"] = gate
+    fault_now = out["probable_fault"]
+
+    # 依嚴重度調整故障措辭（見 contextual_fault 的說明）
+    ctx_label, ctx_note = contextual_fault(
+        out["probable_fault_display"], out["risk_score"], fault_now == "Normal"
+    )
+    if out["gate_overrode"]:
+        ctx_note = (f"分類器判為「{out['gate_overrode']}」，但頻譜上各項特徵都在"
+                    f"同負載正常基準範圍內，找不到支持它的證據，因此依基準判定為正常。")
+
+    # ---- 信心度：四條可檢核條件，不是模型機率 ----
+    # 實測顯示模型機率分不出對錯（跨負載測試裡判錯的檔案一致率高達 96~100%，
+    # 判對的反而只有 76%），所以信心度改由 confidence.py 依證據判定。
+    import confidence as _cf
+    out["confidence_verdict"] = _cf.assess(
+        evidence=out["physical_evidence"],
+        fault_type=fault_now,
+        agreement=float(detail[primary_key]["confidence"]),
+        n_windows=int(detail[primary_key]["n_windows"]),
+        cross_sensor=((float(detail["vibration"]["anomaly_prob"]),
+                       float(detail["current"]["anomaly_prob"]))
+                      if current_usable else None),
+        known_confusion=out["known_confusion"],
+        overrode=out["gate_overrode"],
+        has_physical_baseline=has_baseline,
+    )
+
     out.update({
+        "model_scope": model_scope,
+        "model_is_holdout": model_scope.get(primary_key) is not None,
         "equipment_id": file_id,
         "mode": mode,
         "fault_label": ctx_label,      # 畫面顯示用，已依嚴重度調整措辭
@@ -498,16 +653,124 @@ def diagnose(mode: str, file_id: str, split: str = "test",
         "condition_value": cond_value,
         "condition_unit": spec["condition_unit"],
         "has_temperature": spec["has_temperature"],
-        "has_current": "current" in detail,          # 是否有「獨立」電流模型
-        "uses_current": primary_key == "fused" or "current" in detail,
+        "has_current": current_usable,               # 電流是否作為獨立來源參與判斷
+        "uses_current": primary_key == "fused" or current_usable,
+        "unusable_modalities": unusable,             # 跨負載驗證不通過的模態
+        "current_usable": current_usable,
         "primary_key": primary_key,                  # 主模型在 modality_detail 裡的 key
         "sensors": sensors,
         "ground_truth": truth,
         "ground_truth_display": fault_display(truth),
-        "correct": d.probable_fault == truth,
+        "correct": fault_now == truth,
         "modality_detail": detail,
     })
     return out
+
+
+# ---------------------------------------------------------------- 物理閘門
+# 「先偵測、再診斷」—— 現場振動監測系統的標準架構，也是這套系統原本缺的一層：
+#
+#   偵測（有沒有異常）  由「與同負載正常基準的比值」決定，完全不經模型
+#   診斷（是哪一種）    才交給分類器命名
+#
+# 為什麼一定要加：分類器認不出「正常」。這個資料集只有 3 支正常錄音
+# （0/2/4 Nm 各一支），把其中一支保留起來不給模型看，它就只剩 2 支正常樣本
+# 對上 42 支故障樣本。實測結果是正常錄音被判成轉子不平衡，
+# 而且逐窗一致率高達 76~100% —— 分類器不但錯，還錯得很有把握。
+#
+# 物理層在同一批檔案上乾淨俐落（45 支錄音全跑過）：
+#
+#   3 支正常錄音   最大偏離全部 1.0 倍（連 evidence.MIN_RATIO 的 1.5 倍都沒到）
+#   42 支故障錄音  最大偏離中位數 15.9 倍，最高 51.3 倍
+#
+# 漏抓的是最輕微的不平衡（0583mg / 1169mg，1.0~2.1 倍）。那是物理事實不是缺陷：
+# 最輕的不平衡訊號本來就幾乎與正常無異，而它的正確處置本來就是「持續監測」。
+GATE_MILD = 3.0     # 偏離低於此倍數：有跡象但不明確
+
+# 「有跡象但不明確」時，風險分數的上限。
+#
+# 為什麼要有這個上限：嚴重度應該由物理偏離決定，不是由分類器的機率決定。
+# 分類器對 1.5 倍的輕微不平衡一樣給出 0.99 的異常機率（機率飽和），
+# 規則引擎照單全收就會算出 6/100 的健康分數 —— 畫面顯示「危急・立即停機」，
+# 但頻譜上只有 1.5 倍的偏離。那是對現場的誤導：真的照著停機，
+# 停下來會發現沒什麼好修的，下次就沒人相信這個系統了。
+#
+# 55 分對應規則引擎的 warning 級（50~70），也就是「排程檢查」而不是「立即停機」，
+# 這才是 1.5~3 倍偏離的正確處置。
+GATE_MILD_RISK_CAP = 55
+
+
+def physical_gate(evidence: list[dict] | None) -> str:
+    """回傳 'quiet'（各項都在基準內）／'mild'（有跡象）／'clear'（明確異常）。"""
+    if not evidence:
+        return "quiet"
+    return "mild" if max(e["倍數"] for e in evidence) < GATE_MILD else "clear"
+
+
+def _apply_physical_gate(out: dict, diagnosis, evidence: list[dict]) -> str:
+    """依物理偏離程度調整結論與嚴重度，就地修改 out。
+
+    quiet -> 推翻分類器的故障結論，判為正常
+    mild  -> 保留故障名稱，但把風險壓到「排程檢查」等級
+    clear -> 不動
+    """
+    from knowledge_base import RISK_ACTIONS, get_fault_info
+
+    gate = physical_gate(evidence)
+
+    if gate == "mild" and out["risk_score"] > GATE_MILD_RISK_CAP:
+        top = max(e["倍數"] for e in evidence)
+        out["risk_score"] = GATE_MILD_RISK_CAP
+        out["health_scores"]["綜合健康"] = 100 - GATE_MILD_RISK_CAP
+        # 機械健康也要跟著改。它原本是 (1 - 分類器異常機率)×100，
+        # 而分類器對 1.5 倍的輕微偏離一樣輸出 0.99 -> 機械健康 0。
+        # 畫面上「機械健康 0」配「綜合健康 45」自相矛盾，而且 0 分那條
+        # 紅色長條會蓋過真正的結論。嚴重度既然由物理決定，這一項也一樣。
+        out["health_scores"]["機械健康"] = max(
+            int(out["health_scores"].get("機械健康", 0)), 100 - GATE_MILD_RISK_CAP)
+        out["risk_level"] = "warning"
+        lv = RISK_ACTIONS["warning"]
+        out["risk_level_display"] = lv["display"]
+        out["action_window"] = lv["window"]
+        out["should_stop"] = False
+        out["triggered_rules"] = [
+            f"R0 物理基準比對：最大偏離為同負載正常基準的 {top:.1f} 倍，"
+            f"屬輕度偏離，風險上限設為 {GATE_MILD_RISK_CAP} 分（排程檢查而非立即停機）"
+        ] + list(out.get("triggered_rules") or [])
+        return gate
+
+    if gate != "quiet" or diagnosis.probable_fault == "Normal":
+        return gate
+
+    info = get_fault_info("Normal")
+    risk = min(int(out["risk_score"]), 25)
+    lv = RISK_ACTIONS["healthy"]
+
+    out.update({
+        "risk_score": risk,
+        "risk_level": "healthy",
+        "risk_level_display": lv["display"],
+        "action_window": lv["window"],
+        "should_stop": False,
+        "probable_fault": "Normal",
+        "probable_fault_display": info["display"],
+        "causes": info["causes"], "checks": info["checks"],
+        "actions": info["actions"], "tools": info["tools"],
+        "parts": info["parts"], "safety": info["safety"],
+        "effort": info["effort"], "known_confusion": info["known_confusion"],
+        "gate_overrode": fault_display(diagnosis.probable_fault),
+    })
+    out["health_scores"]["綜合健康"] = 100 - risk
+    # 同上：物理層說一切都在基準內，機械健康就不能還掛著分類器算出來的 0 分
+    out["health_scores"]["機械健康"] = max(
+        int(out["health_scores"].get("機械健康", 0)), 100 - risk)
+    out["triggered_rules"] = [
+        f"R0 物理基準比對：各項頻譜特徵均未超過同負載正常基準 1.5 倍，"
+        f"依基準判定為正常"
+        f"（分類器判為「{fault_display(diagnosis.probable_fault)}」，"
+        f"但頻譜上找不到支持它的譜線，不予採信）"
+    ] + list(out.get("triggered_rules") or [])
+    return gate
 
 
 def contextual_fault(fault_display_name: str, risk_score: float,

@@ -30,6 +30,35 @@ def _health_color(score: float) -> str:
     return T.tone_color(score)
 
 
+# ---------------------------------------------------------------- 文字寬度
+# SVG 的 <text> 不會自動換行也不會裁切，超出機台方塊就直接畫到隔壁去
+# （debug 清單第 1 點：「早期跡象：轉子不平衡」10 個字疊到右邊的邊框上）。
+# 這裡先估寬度，塞不下就先縮字級，還是塞不下才截字加省略號——
+# 縮字級比截字保留更多資訊，所以優先。
+def _text_width(s: str, size: float) -> float:
+    """估算字串在 SVG 裡的寬度（px）。
+
+    中日韓字元是全形，寬度約等於字級；ASCII 約 0.55 倍。
+    這只是估算，但誤差遠小於我們留的邊距，足夠用來決定要不要縮排。
+    """
+    w = 0.0
+    for ch in s:
+        w += size if ord(ch) > 0x2E80 else size * 0.55
+    return w
+
+
+def _fit_text(s: str, size: float, max_w: float, min_size: float = 8.5) -> tuple[str, float]:
+    """回傳 (實際要畫的字串, 實際字級)。"""
+    while size > min_size and _text_width(s, size) > max_w:
+        size -= 0.5
+    if _text_width(s, size) <= max_w:
+        return s, size
+    cut = s
+    while cut and _text_width(cut + "…", size) > max_w:
+        cut = cut[:-1]
+    return (cut + "…") if cut else s, size
+
+
 def _defs() -> str:
     """漸層、輝光濾鏡、網格圖樣。"""
     return f"""
@@ -118,6 +147,16 @@ def _machine(x: float, y: float, m: dict) -> str:
            f'filter="url(#softglow)">{pulse}</circle>')
 
     tx = x + 56
+    # 右欄可用寬度：從 tx 到機體右緣，再留 12px 邊距——
+    # 留太少的話文字會貼到右邊的角標上，看起來仍然像溢出。
+    inner_w = MACH_W - (tx - x) - 12
+    fault_txt, fault_size = _fit_text(m["fault"], 10.5, inner_w)
+
+    # 「可信度 100%」在每一台上都一樣，看起來像寫死的（debug 清單第 6 點）。
+    # 現在顯示的是證據型信心度等級，由 confidence.py 依四條件判定。
+    conf_text = m.get("confidence_level", "—")
+    conf_color = T.conf_color(conf_text)
+
     txt = (
         f'<text x="{x+9}" y="{y+17}" font-size="12" font-weight="700" fill="{c}" '
         f'font-family="monospace" letter-spacing="1">{m["machine_id"]}</text>'
@@ -126,9 +165,10 @@ def _machine(x: float, y: float, m: dict) -> str:
         f'font-family="monospace" filter="url(#softglow)">{health:.0f}</text>'
         f'<text x="{tx+45}" y="{y+52}" font-size="10" fill="{T.MUTED}" '
         f'font-family="monospace">/100</text>'
-        f'<text x="{tx}" y="{y+68}" font-size="10.5" fill="{T.TEXT}">{m["fault"]}</text>'
-        f'<text x="{tx}" y="{y+82}" font-size="9" fill="{T.MUTED}" font-family="monospace">'
-        f'CONF {m["confidence"]:.0%}</text>'
+        f'<text x="{tx}" y="{y+68}" font-size="{fault_size}" fill="{T.TEXT}">'
+        f'<title>{m["fault"]}</title>{fault_txt}</text>'
+        f'<text x="{tx}" y="{y+82}" font-size="9" fill="{T.MUTED}">信心度 '
+        f'<tspan fill="{conf_color}" font-weight="700">{conf_text}</tspan></text>'
     )
 
     warn = ""
@@ -226,11 +266,13 @@ def floor_svg(snapshot: list[dict], subtitle: str = "", clock: str = "") -> str:
     ly = H - 20
     p.append(f'<line x1="20" y1="{ly-22}" x2="{W-20}" y2="{ly-22}" '
              f'stroke="{T.LINE}" stroke-width="1"/>')
-    for i, (col, label) in enumerate([(T.OK, "正常 100–70"), (T.WARN, "注意 69–30"),
-                                      (T.BAD, "異常 29–0")]):
-        lx = 26 + i * 132
-        p.append(f'<rect x="{lx}" y="{ly-9}" width="10" height="10" fill="{col}"/>')
-        p.append(f'<text x="{lx+16}" y="{ly}" font-size="10.5" fill="{T.MUTED}">{label}</text>')
+    # 圖例的分數區間直接取自 ui_theme.BANDS，與 KPI 卡片、分數條說明同一份來源。
+    # 之前這裡寫死「正常 100–70」，KPI 卡片自己另外分桶，兩邊數量對不起來。
+    for i, band in enumerate(T.BANDS):
+        lx = 26 + i * 172
+        p.append(f'<rect x="{lx}" y="{ly-9}" width="10" height="10" fill="{band["color"]}"/>')
+        p.append(f'<text x="{lx+16}" y="{ly}" font-size="10.5" fill="{T.MUTED}">'
+                 f'{band["name"]} {band["range"]}</text>')
     p.append(
         f'<text x="{W-26}" y="{ly}" font-size="10" fill="{T.MUTED}" text-anchor="end">'
         f'閃爍＝建議立即停機　·　主軸轉速反映健康度　·　數值為綜合健康分數</text>'

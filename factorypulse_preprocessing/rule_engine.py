@@ -125,12 +125,24 @@ def assess_temperature(temp: TemperatureInput) -> tuple[str, float]:
 def diagnose(vibration: ModalityInput,
              current: ModalityInput,
              temperature: TemperatureInput,
-             load_nm: float | None = None) -> Diagnosis:
+             load_nm: float | None = None,
+             use_current: bool = True) -> Diagnosis:
+    """use_current=False：電流不參與判斷。
+
+    ⚠️ 這個開關不是可有可無的。呼叫端在電流不可用時，為了湊滿介面會把振動的
+    結果同時當成電流傳進來；如果照常跑跨感測規則，R1「振動與電流同時異常」
+    就會對每一台都成立 —— 畫面上出現「兩個獨立來源互相驗證」，
+    但實際上只有一個來源，講了兩次。那是最糟的一種假證據。
+
+    關掉之後：電流的權重併回振動，所有跨感測規則（R1/R2/R3/R6）一律不評估。
+    """
     temp_status, temp_score = assess_temperature(temperature)
 
     # ---- 基礎風險分數（加權平均）----
-    base = (vibration.anomaly_prob * WEIGHT_VIBRATION
-            + current.anomaly_prob * WEIGHT_CURRENT
+    w_vib = WEIGHT_VIBRATION + (0.0 if use_current else WEIGHT_CURRENT)
+    w_cur = WEIGHT_CURRENT if use_current else 0.0
+    base = (vibration.anomaly_prob * w_vib
+            + current.anomaly_prob * w_cur
             + temp_score * WEIGHT_TEMPERATURE)
     risk = base * 100
 
@@ -148,9 +160,10 @@ def diagnose(vibration: ModalityInput,
         risk += amount * (100 - risk) / 100
 
     vib_abnormal = vibration.anomaly_prob >= ANOMALY_HIGH
-    cur_abnormal = current.anomaly_prob >= ANOMALY_HIGH
     vib_suspect = vibration.anomaly_prob >= ANOMALY_MID
-    cur_suspect = current.anomaly_prob >= ANOMALY_MID
+    # 電流不可用時一律當成「沒有意見」，跨感測規則就不會誤觸發
+    cur_abnormal = use_current and current.anomaly_prob >= ANOMALY_HIGH
+    cur_suspect = use_current and current.anomaly_prob >= ANOMALY_MID
     temp_rising = temperature.trend_slope >= TEMP_SLOPE_RISING
     temp_hot = temperature.delta_from_baseline >= TEMP_DELTA_CLEAR
 
@@ -215,16 +228,17 @@ def diagnose(vibration: ModalityInput,
     # ---- 四面向健康分數 ----
     health = {
         "機械健康": int(round((1 - vibration.anomaly_prob) * 100)),
-        "負載健康": int(round((1 - current.anomaly_prob) * 100)),
+        "負載健康": int(round((1 - current.anomaly_prob) * 100)) if use_current else None,
         "熱狀態": int(round((1 - temp_score) * 100)),
         "綜合健康": 100 - risk,
     }
+    health = {k: v for k, v in health.items() if v is not None}
 
     # ---- 決定最可能的故障 ----
     # 振動是主要診斷來源；振動正常時才考慮電流的判斷
     if vib_suspect and vibration.fault_type != "Normal":
         fault = vibration.fault_type
-    elif cur_suspect and current.fault_type != "Normal":
+    elif use_current and cur_suspect and current.fault_type != "Normal":
         fault = current.fault_type
     else:
         fault = "Normal"
@@ -235,8 +249,10 @@ def diagnose(vibration: ModalityInput,
     evidence.append({
         "來源": "振動", "狀態": _level_text(vibration.anomaly_prob),
         "數值": f"異常機率 {vibration.anomaly_prob:.2f}",
+        # 這裡以前寫「可信度 0.85」。那個數字其實是逐窗多數決的一致率，
+        # 叫「可信度」會被讀成「這個診斷有 85% 是對的」，是兩回事。
         "說明": f"分類為 {get_fault_info(vibration.fault_type)['display']}"
-                f"（可信度 {vibration.confidence:.2f}）",
+                f"（逐窗一致率 {vibration.confidence:.0%}）",
     })
     evidence.append({
         "來源": "電流", "狀態": _level_text(current.anomaly_prob),

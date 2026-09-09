@@ -23,6 +23,7 @@ import llm_assistant as llm_mod
 import pandas as pd
 import streamlit as st
 
+import charts as ch
 import dashboard_data as dd
 import factory_sim as sim
 import factory_view as fv
@@ -45,7 +46,6 @@ RISK_COLOR = {
 
 score_color = T.tone_color
 score_bar = T.score_bar
-confidence_tag = T.confidence
 
 
 def risk_badge(level: str) -> str:
@@ -54,7 +54,7 @@ def risk_badge(level: str) -> str:
 
 # ---------------------------------------------------------------- 側邊列
 st.sidebar.title("⚙️ FactoryPulse")
-st.sidebar.caption("免改機的多感測設備健康診斷系統")
+st.sidebar.caption("旋轉設備健康診斷與維修決策平台")
 
 mode = st.sidebar.radio(
     "運轉模式",
@@ -143,6 +143,16 @@ def cached_diagnose(mode: str, fid: str):
     return dd.diagnose(mode, fid)
 
 
+@st.cache_data(show_spinner=False)
+def load_audit():
+    """train_lolo.py 產生的信心度稽核表。沒有就回 None。"""
+    from pathlib import Path
+    p = Path(__file__).parent / "results" / "lolo_confidence.csv"
+    if not p.exists():
+        return None
+    return pd.read_csv(p)
+
+
 # ---------------------------------------------------------------- 廠區總覽
 if page == "廠區總覽":
     require_models()
@@ -171,31 +181,75 @@ if page == "廠區總覽":
         unsafe_allow_html=True,
     )
 
+    # 模型來源橫幅。這是整個畫面最需要主動說清楚的一件事：
+    # 舊版用的是同錄音切分訓練的模型，那組數字《數字口徑表》明文不可對外。
+    if mode == "load":
+        if dd.lolo_available():
+            st.success(
+                "**畫面上每一台的診斷，都來自沒看過那個負載的模型。**　"
+                "每台機台使用 leave-one-load-out 模型（0/2/4 Nm 各訓練一個，"
+                "各自排除自己那個負載），因此不存在「同一支錄音同時出現在訓練與測試」的問題。"
+            )
+        else:
+            st.error(
+                "**目前使用的是同錄音切分訓練的模型**，其數字依《數字口徑表》不可對外引用"
+                "（畫面上會出現一片 100% 的可信度）。請先執行 `python train_lolo.py` "
+                "產生 leave-one-load-out 模型，重啟後即會自動切換。"
+            )
+
     with st.spinner("讀取各機台感測資料..."):
         snap = cached_snapshot(mode, minute)
 
     df = pd.DataFrame([{k: v for k, v in s.items() if k != "diagnosis"} for s in snap])
 
     n_stop = int(df["should_stop"].sum())
-    n_high = int(df["risk_level"].isin(["高風險", "危急"]).sum())
-    n_warn = int((df["risk_level"] == "警告").sum())
-    n_ok = int(df["risk_level"].isin(["健康", "注意"]).sum())
     avg = df["health"].mean()
 
-    st.markdown(
-        T.kpi_row([
-            dict(label="機台總數", value=str(len(df)), sub="全部同型 VMC-850", tone=T.ACCENT),
-            dict(label="平均健康度", value=f"{avg:.0f}", sub="綜合健康分數",
-                 tone=T.tone_color(avg)),
-            dict(label="正常 / 注意", value=str(n_ok), sub="可持續運轉", tone=T.OK),
-            dict(label="警告", value=str(n_warn), sub="排程檢修", tone=T.WARN),
-            dict(label="高風險 / 危急", value=str(n_high), sub="優先處理", tone=T.BAD),
-            dict(label="建議停機", value=str(n_stop),
-                 sub="立即介入" if n_stop else "無",
-                 tone=T.CRIT if n_stop else T.OK),
-        ]),
-        unsafe_allow_html=True,
-    )
+    # ⚠️ KPI 的三個桶子必須用「健康分數」切，不能用風險等級的名稱切。
+    # 原本寫成「正常/注意」= 健康+注意、「警告」、「高風險/危急」三桶，
+    # 但廠房圖的機台顏色是 T.tone_color(健康分數) 決定的，兩邊切點不同：
+    # 健康分數 70 分的機台，風險是 30 -> 等級「注意」被算進第一桶（綠），
+    # 廠房圖卻依 tone_color 畫成黃色 —— 於是「綠色 1 台，KPI 說 3 台」。
+    # 現在直接用 tone_color 的同一組邊界分桶，數量與顏色保證對得上。
+    band_by_color = {b["color"]: b["name"] for b in T.BANDS}
+    counts = {b["name"]: 0 for b in T.BANDS}
+    for h in df["health"]:
+        counts[band_by_color[T.tone_color(h)]] += 1
+
+    kpis = [
+        dict(label="機台總數", value=str(len(df)), sub="全部同型 VMC-850", tone=T.ACCENT),
+        dict(label="平均健康度", value=f"{avg:.0f}", sub="綜合健康分數",
+             tone=T.tone_color(avg)),
+    ]
+    kpis += [
+        dict(label=f"{b['dot']} {b['name']}", value=str(counts[b["name"]]),
+             sub=f"{b['range']} 分・{b['sub']}", tone=b["color"])
+        for b in T.BANDS
+    ]
+    kpis.append(dict(label="建議停機", value=str(n_stop),
+                     sub="立即介入" if n_stop else "無",
+                     tone=T.CRIT if n_stop else T.OK))
+
+    st.markdown(T.kpi_row(kpis), unsafe_allow_html=True)
+    st.caption(T.SCALE_NOTE)
+
+    with st.expander("分級標準說明（顏色三階、等級五級，分別是怎麼切的）"):
+        st.markdown(
+            "**顏色三階**　監控畫面要能一眼分辨「可以放著／要排程／要處理」，"
+            "所以廠房圖、KPI 卡片、健康分項的分數條都只用三種顏色，切點完全一致：\n\n"
+            + "\n".join(
+                f"- {b['dot']} **{b['name']}**　健康分數 {b['range']} 分　—　{b['sub']}"
+                for b in T.BANDS
+            )
+            + "\n\n**等級五級**　精確的等級由徽章顯示，用來決定處理時限。"
+              "每一級都落在上面某一個顏色帶裡，不會出現徽章寫「高風險」但分數條是黃色的矛盾：\n\n"
+            + "\n".join(
+                f"- {T.level_dot(lv)}　健康分數 {rng} 分"
+                for lv, rng in T.LEVEL_RANGE.items()
+            )
+            + "\n\n健康分數 = 100 − 風險分數。風險分數由規則引擎依各感測來源的異常機率"
+              "加權後計算，再依交叉驗證規則調整。"
+        )
 
     if not auto_ok:
         st.caption("你的 Streamlit 版本不支援自動更新（需 1.37+），"
@@ -220,7 +274,16 @@ if page == "廠區總覽":
     left, right = st.columns([2, 1])
     with left:
         st.subheader("各機台健康分數")
-        st.bar_chart(df.set_index("machine_id")["health"], height=300)
+        rank = df[["machine_id", "name", "health"]].copy()
+        rank["機台"] = rank["machine_id"] + "　" + rank["name"]
+        # 長條顏色用與廠房圖同一支 tone_color，同一台機器在兩張圖上同色
+        rank["_c"] = rank["health"].map(T.tone_color)
+        st.altair_chart(
+            ch.hbar(rank, "機台", "health",
+                    x_title="綜合健康分數（0–100 分，越高越好）",
+                    y_title="機台", height=320, color_col="_c"),
+            use_container_width=True,
+        )
     with right:
         st.subheader("需要處理的機台")
         urgent = df[df["should_stop"]]
@@ -234,11 +297,17 @@ if page == "廠區總覽":
     st.subheader("完整清單")
     show = df[["machine_id", "name", "station", "health", "risk_level",
                "fault", "confidence", "action_window"]].copy()
-    show["confidence"] = show["confidence"].map(lambda v: f"{v:.0%}")
+    # 風險等級加上顏色圓點，與廠房圖、KPI 卡片用同一組配色，
+    # 這樣同一台機台在三個地方看到的顏色一定一樣。
+    show["risk_level"] = show["risk_level"].map(T.level_dot)
+    # 「可信度 100%」全欄一模一樣，看起來像寫死的。現在這一欄是證據型
+    # 信心度等級（confidence.py 的四條件判定），不是模型機率。
+    show["confidence"] = [T.conf_dot(m["confidence_level"]) for m in snap]
     show.columns = ["機台編號", "工站", "產線", "健康分數", "風險等級",
-                    "研判故障", "可信度", "處理時限"]
+                    "研判故障", "信心度", "處理時限"]
     st.dataframe(show.sort_values("健康分數"), hide_index=True,
                  use_container_width=True, height=400)
+    st.caption(T.CONF_NOTE)
 
 
 # ---------------------------------------------------------------- 設備診斷
@@ -254,6 +323,7 @@ elif page == "設備診斷":
 
     health = r["health_scores"].get("綜合健康", 100 - r["risk_score"])
     conf = r["modality_detail"][r["primary_key"]]["confidence"]
+    verdict = r["confidence_verdict"]
     cond = (f"{r['condition_unit']} {r['condition_value']:.0f}"
             if r["condition_value"] is not None else "—")
 
@@ -262,7 +332,7 @@ elif page == "設備診斷":
             f"{mid}　{machine.name}",
             f"{machine.station}　·　{sim.CNC_MODEL}　·　運轉條件 {cond}",
             r["fault_label"],
-            f"可信度 {conf:.0%}",
+            f"信心度 {verdict['level']}（{verdict['summary']}）",
         ),
         unsafe_allow_html=True,
     )
@@ -271,11 +341,13 @@ elif page == "設備診斷":
         T.kpi_row([
             dict(label="綜合健康度", value=f"{health:.0f}", sub="滿分 100",
                  tone=T.tone_color(health)),
-            dict(label="風險等級", value=r["risk_level_display"],
+            dict(label="風險等級", value=T.level_dot(r["risk_level_display"]),
                  sub=f"風險分數 {r['risk_score']}",
                  tone=RISK_COLOR.get(r["risk_level_display"], T.ACCENT)),
             dict(label="處理時限", value=r["action_window"], sub="建議介入時間",
                  tone=T.WARN if r["action_window"] != "—" else T.OK),
+            dict(label="信心度", value=verdict["level"], sub=verdict["summary"],
+                 tone=T.conf_color(verdict["level"])),
             dict(label="運轉決策",
                  value="建議停機" if r["should_stop"] else "可運轉",
                  sub="立即安排" if r["should_stop"] else "維持監測",
@@ -283,6 +355,21 @@ elif page == "設備診斷":
         ]),
         unsafe_allow_html=True,
     )
+
+    # 物理閘門推翻分類器時一定要講出來，否則畫面顯示「正常」但模型其實有意見，
+    # 等於把系統內部的不一致藏起來。
+    if r.get("gate_overrode"):
+        st.warning(
+            f"**兩層判斷不一致**　分類器判為「{r['gate_overrode']}」，"
+            f"但頻譜上各項特徵都在同負載正常基準範圍內（最大偏離未達 1.5 倍），"
+            f"找不到支持它的物理證據。本系統採「先偵測、再診斷」架構，"
+            f"偵測層不經模型，因此依基準判定為正常 —— 但信心度不給「高」，"
+            f"建議延長取樣後複檢。"
+        )
+
+    st.markdown("**信心度依據**")
+    st.markdown(T.check_list(verdict["checks"]), unsafe_allow_html=True)
+    st.caption(T.CONF_NOTE)
 
     # 分類與嚴重度是兩件事：模型認出故障特徵，不代表現在就嚴重。
     # 健康度還好時主動解釋，避免使用者看到「故障名稱 + 綠色分數」以為系統出錯。
@@ -303,7 +390,15 @@ elif page == "設備診斷":
         st.subheader("健康分項")
         html = "".join(score_bar(k, v) for k, v in r["health_scores"].items())
         st.markdown(html, unsafe_allow_html=True)
-        st.caption("綠 100~70／黃 69~30／紅 29~0。拆成多個面向比單一數字更容易判斷問題出在哪一環。")
+        # ⚠️ 這行不要用 `~` 當範圍符號。Streamlit 的 Markdown 會把一行裡的
+        # 兩個 `~` 當成刪除線語法吃掉，畫面上就變成「綠 10070／黃 6930」
+        # ——分數區間直接消失（debug 清單第 7 點）。用連接號 – 就沒事。
+        st.caption(
+            f"{T.BAND_OK['dot']} 綠 {T.BAND_OK['range']}／"
+            f"{T.BAND_WARN['dot']} 黃 {T.BAND_WARN['range']}／"
+            f"{T.BAND_BAD['dot']} 紅 {T.BAND_BAD['range']} 分。"
+            "拆成多個面向比單一數字更容易判斷問題出在哪一環。"
+        )
 
     with right:
         st.subheader("觸發的判斷規則")
@@ -349,19 +444,63 @@ elif page == "設備診斷":
                 st.info(f"**預估工時**　{r['effort']}")
 
     st.markdown("---")
-    st.subheader("異常程度隨時間變化")
-    vib = r["modality_detail"][r["primary_key"]]
-    series = pd.DataFrame({"振動異常機率": vib["anomaly_series"]})
-    if "current" in r["modality_detail"]:
-        cur_s = r["modality_detail"]["current"]["anomaly_series"]
-        n = min(len(series), len(cur_s))
-        series = series.iloc[:n].copy()
-        series["電流異常機率"] = cur_s[:n]
-    st.line_chart(series, height=280)
-    st.caption(
-        "每個點是一秒的訊號窗。系統取中位數而非平均值判定，"
-        "避免單一瞬間干擾造成誤報——工業現場的原則是「持續異常才算異常」。"
-    )
+    st.subheader("嚴重度隨時間變化")
+
+    sev = r.get("severity_series")
+    if sev:
+        # 主線畫「物理嚴重度」而不是分類器機率。
+        # 分類器機率是決策不是量測，在明確樣本上會飽和成一條水平線
+        # （實測 FP-10 十七個窗全距 0.000002）；物理量才會真的動。
+        srs = pd.DataFrame({f"{sev['名稱']}（倍）": sev["ratios"]})
+        st.altair_chart(
+            ch.line(srs,
+                    x_title="時間（秒，每點為 1 秒訊號窗）",
+                    y_title="相對同負載正常基準的倍數（1.0 = 與正常相同）",
+                    height=300),
+            use_container_width=True,
+        )
+        _r = pd.Series(sev["ratios"])
+        st.caption(
+            f"量測項目：**{sev['名稱']} @ {sev['位置']}**　·　"
+            f"同負載正常基準 {sev['正常基準']:.4g}　·　"
+            f"本段逐窗 {_r.min():.2f}× ~ {_r.max():.2f}×（中位 {_r.median():.2f}×）。"
+            f"這條線直接來自頻譜，不經模型 —— 就算不相信 AI，也可以自己拿頻譜圖核對。"
+        )
+        with st.expander("這個量測項目代表什麼？"):
+            st.markdown(sev["物理意義"])
+    else:
+        st.info("此模式沒有正常基準檔，無法計算物理嚴重度。")
+
+    # 分類器機率降為次要參考。留著是因為它仍然是判斷的一部分，
+    # 但畫在下面並且明說它為什麼常常是一條直線。
+    with st.expander("分類器的異常機率（次要參考）"):
+        vib = r["modality_detail"][r["primary_key"]]
+        series = pd.DataFrame({"振動異常機率": vib["anomaly_series"]})
+        if "current" in r["modality_detail"] and r.get("current_usable"):
+            cur_s = r["modality_detail"]["current"]["anomaly_series"]
+            n = min(len(series), len(cur_s))
+            series = series.iloc[:n].copy()
+            series["電流異常機率"] = cur_s[:n]
+
+        st.altair_chart(
+            ch.line(series,
+                    x_title="時間（秒，每點為 1 秒訊號窗）",
+                    y_title="異常分數（0–1，1 = 完全不像正常）",
+                    y_domain=(0.0, 1.0), height=260),
+            use_container_width=True,
+        )
+        _flat = series["振動異常機率"]
+        if float(_flat.max() - _flat.min()) < 0.02:
+            st.caption(
+                f"**這條線是平的（約 {float(_flat.median()):.3f}）。這是正常現象，不是圖表故障。**　"
+                "樹模型在明確樣本上機率會飽和到 0 或 1，實測整段訊號的全距只有 1e-6 量級。"
+                "這正是我們把趨勢圖主線改成物理嚴重度的原因：機率是決策，不是量測。"
+            )
+        else:
+            st.caption(
+                "每個點是一秒的訊號窗。系統取中位數而非平均值判定，"
+                "避免單一瞬間干擾造成誤報——工業現場的原則是「持續異常才算異常」。"
+            )
 
 
 # ---------------------------------------------------------------- 多感測證據
@@ -375,17 +514,73 @@ elif page == "多感測證據":
     machine = sim.machine_by_id(mode, mid)
     r = cached_diagnose(mode, machine.source)
     conf = r["modality_detail"][r["primary_key"]]["confidence"]
+    verdict = r["confidence_verdict"]
 
     st.markdown(
         T.command_bar(
             "EVIDENCE · 多感測證據",
             f"{mid} {machine.name}　·　這一頁回答「憑什麼相信這個結果」",
             r["fault_label"],
-            f"可信度 {conf:.0%}",
+            f"信心度 {verdict['level']}（{verdict['summary']}）",
         ),
         unsafe_allow_html=True,
     )
 
+    # ---- 這個結論是哪個模型做出來的 ----
+    scope = r.get("model_scope", {}).get(r["primary_key"])
+    if scope is not None:
+        bundle = dd.load_lolo(r["primary_key"], scope)
+        acc = bundle.get("holdout_accuracy")
+        f1 = bundle.get("holdout_macro_f1")
+        st.success(
+            f"**這台機台的判斷來自「沒看過 {scope} Nm」的模型。**　"
+            f"訓練資料為 {'、'.join(f'{l} Nm' for l in bundle['training_loads'])}"
+            f"（{bundle['n_train']:,} 個時間窗），{scope} Nm 完全排除在訓練之外。"
+            + (f"　該模型在這個保留負載上的逐窗準確率 {acc:.1%}、macro-F1 {f1:.1%}。"
+               if acc is not None else "")
+        )
+    elif mode == "load":
+        st.error(
+            "**這個結論來自看過同一支錄音的模型**，依《數字口徑表》不可對外引用。"
+            "請執行 `python train_lolo.py` 後重啟。"
+        )
+
+    st.subheader("信心度依據")
+    st.markdown(
+        f"目前等級 **{T.conf_dot(verdict['level'])}**　·　{verdict['summary']}　—　"
+        f"{verdict['note']}"
+    )
+    st.markdown(T.check_list(verdict["checks"]), unsafe_allow_html=True)
+    st.caption(T.CONF_NOTE)
+
+    with st.expander("信心度分級 vs 實際對錯（全部 45 支錄音的稽核結果）"):
+        _audit = load_audit()
+        if _audit is None:
+            st.info("尚未產生稽核表。執行 `python train_lolo.py` 會一併輸出 "
+                    "`results/lolo_confidence.csv`。")
+        else:
+            tab = (_audit.groupby("level")
+                   .agg(錄音檔數=("correct", "size"), 判對=("correct", "sum"))
+                   .reindex(["高", "中", "低"]).dropna(how="all").reset_index())
+            tab["正確率"] = (tab["判對"] / tab["錄音檔數"]).map(lambda v: f"{v:.0%}")
+            tab.columns = ["信心度", "錄音檔數", "判對", "正確率"]
+            st.dataframe(tab, hide_index=True, use_container_width=True)
+            st.markdown(
+                "每一支錄音都由「沒看過它那個負載」的模型判定，等級是**判定前**算出來的，"
+                "對錯是**事後**比對的。判錯的幾支：")
+            wrong = _audit[_audit.correct == 0][
+                ["file_id", "truth", "predicted", "level", "agreement"]]
+            wrong.columns = ["錄音檔", "真實狀態", "系統研判", "信心度", "逐窗一致率"]
+            st.dataframe(wrong, hide_index=True, use_container_width=True)
+            st.caption(
+                "注意「逐窗一致率」那一欄：判錯的檔案一致率都在 89% 以上。"
+                "這就是為什麼信心度不能用模型自己的一致率或機率 —— "
+                "它在錯的時候一樣很有把握。45 支錄音樣本很小，"
+                "上表是佐證不是機率保證。"
+            )
+
+    st.markdown("---")
+    st.subheader("各感測來源的意見")
     ev = pd.DataFrame(r["evidence"])
     if not r["has_temperature"]:
         ev = ev[ev["來源"] != "溫度"]
@@ -442,18 +637,37 @@ elif page == "多感測證據":
         vd = r["modality_detail"][r["primary_key"]]["vote_distribution"]
         vote = pd.DataFrame([(dd.fault_display(k), v) for k, v in vd.items()],
                             columns=["判斷結果", "窗數"]).sort_values("窗數", ascending=False)
-        st.bar_chart(vote.set_index("判斷結果")["窗數"], height=260)
-        st.markdown(f"**多數決一致率　{confidence_tag(conf)}**", unsafe_allow_html=True)
+        # 橫向長條圖。原本用 st.bar_chart，它把「判斷結果」這個類別欄位
+        # 當成數值軸處理，Y 軸標成 0/20/40/…（沒有意義），中文標籤還被擠成直排。
+        st.altair_chart(
+            ch.hbar(vote, "判斷結果", "窗數",
+                    x_title="時間窗數量（個，每窗 1 秒）",
+                    y_title="模型的判斷結果", height=260),
+            use_container_width=True,
+        )
+        st.markdown(
+            f'**逐窗多數決一致率**　<span class="mono" style="color:{T.TEXT};'
+            f'font-weight:700">{conf:.0%}</span>', unsafe_allow_html=True)
         st.caption(
             "一致率高代表模型在不同時間窗都給出相同答案；"
             "低於 60% 代表判斷搖擺，這種情況應轉人工複檢。"
+            "注意這是「模型前後說法一不一致」，不是「診斷正確率」——"
+            "訊號穩定時本來就容易接近 100%。"
         )
 
     with right:
         st.subheader("這個模型最看重哪些特徵")
         imp = dd.feature_importance(mode, dd.primary_modality(mode), top=10)
         if not imp.empty:
-            st.bar_chart(imp.set_index("feature")["importance"], height=260)
+            # 同樣改橫向：`ch3_env_BPFO_sideband` 這種長特徵名，
+            # 直向長條圖只能塞進 `ch3_env_BPFO_s...`，看不出是哪個特徵。
+            st.altair_chart(
+                ch.hbar(imp.rename(columns={"feature": "特徵", "importance": "重要度"}),
+                        "特徵", "重要度",
+                        x_title="特徵重要度（Gini importance，全部特徵合計為 1）",
+                        y_title="特徵名稱", height=300, val_format=".3f"),
+                use_container_width=True,
+            )
             st.caption(
                 "直接取自當前模式的模型。ch0~ch3 分別是軸承座 A/B 的 x/y 方向振動。"
                 "`env_BPFO` / `env_BPFI` 是包絡譜在軸承內外環特徵頻率的譜線強度，"
@@ -469,13 +683,13 @@ elif page == "多感測證據":
     st.subheader("判斷邏輯")
     st.markdown(
         """
-        0. **特徵萃取對準物理** — 振動訊號先做包絡解調，量測軸承內外環特徵頻率
+        1. **特徵萃取對準物理** — 振動訊號先做包絡解調，量測軸承內外環特徵頻率
            （BPFO 183.5 Hz / BPFI 268.8 Hz）的譜線強度，以及轉頻諧波（1x 50.2 Hz、
            3x 150.4 Hz）。不是丟一堆統計量給模型硬學，每個特徵都對應一個已知的故障機制
-        1. **各感測器獨立判斷** — 振動模型與電流模型分別對每一秒的訊號給出異常機率與故障分類
-        2. **規則引擎交叉驗證** — 兩者一致時提高可信度；只有單一來源異常時降級為「疑似」並要求複檢
-        3. **溫度判斷急迫性** — 溫度不參與故障分類（它變化太慢），只用來判斷是否持續惡化、需不需要立即停機
-        4. **對照知識庫** — 依故障類型取出對應的可能原因、檢查項目與處置方式
+        2. **各感測器獨立判斷** — 振動模型與電流模型分別對每一秒的訊號給出異常機率與故障分類
+        3. **規則引擎交叉驗證** — 兩者一致時提高可信度；只有單一來源異常時降級為「疑似」並要求複檢
+        4. **溫度判斷急迫性** — 溫度不參與故障分類（它變化太慢），只用來判斷是否持續惡化、需不需要立即停機
+        5. **對照知識庫** — 依故障類型取出對應的可能原因、檢查項目與處置方式
         """
     )
     st.caption(
@@ -588,6 +802,8 @@ elif page == "即時診斷":
     if "live_diag_result" in st.session_state:
         res = st.session_state["live_diag_result"]
         src_note_display = st.session_state["live_diag_src_note"]
+        live_verdict = (st.session_state.get("live_diag_llm") or {}).get(
+            "confidence_verdict") or {"level": "—", "summary": "", "checks": []}
 
         st.markdown("---")
         st.subheader(f"診斷結果　—　{src_note_display}")
@@ -599,18 +815,39 @@ elif page == "即時診斷":
                      tone=T.tone_color((1 - ap) * 100)),
                 dict(label="研判故障", value=dd.fault_display(res["fault_type"]),
                      sub="逐窗多數決", tone=T.ACCENT),
-                dict(label="判斷可信度", value=f"{res['confidence']:.0%}",
-                     sub="多數決一致率",
-                     tone=T.OK if res["confidence"] >= 0.8
-                          else (T.WARN if res["confidence"] >= 0.6 else T.BAD)),
+                dict(label="信心度", value=live_verdict["level"],
+                     sub=live_verdict["summary"],
+                     tone=T.conf_color(live_verdict["level"])),
                 dict(label="分析時間窗", value=str(res["n_windows"]),
                      sub="每窗 1 秒訊號", tone=T.ACCENT),
             ]),
             unsafe_allow_html=True,
         )
+        st.markdown("**信心度依據**")
+        st.markdown(T.check_list(live_verdict["checks"]), unsafe_allow_html=True)
+        st.caption(T.CONF_NOTE)
 
-        st.subheader("各時間窗的異常程度")
-        st.line_chart(pd.DataFrame({"異常機率": res["anomaly_series"]}), height=260)
+        _sev = (st.session_state.get("live_diag_llm") or {}).get("severity_series")
+        if _sev:
+            st.subheader("嚴重度隨時間變化")
+            st.altair_chart(
+                ch.line(pd.DataFrame({f"{_sev['名稱']}（倍）": _sev["ratios"]}),
+                        x_title="時間窗編號（每窗 1 秒訊號）",
+                        y_title="相對同負載正常基準的倍數（1.0 = 與正常相同）",
+                        height=280),
+                use_container_width=True,
+            )
+            st.caption(f"量測項目：{_sev['名稱']} @ {_sev['位置']}　·　"
+                       f"正常基準 {_sev['正常基準']:.4g}　·　這條線直接來自頻譜，不經模型。")
+
+        st.subheader("各時間窗的異常程度（分類器機率，次要參考）")
+        st.altair_chart(
+            ch.line(pd.DataFrame({"異常分數": res["anomaly_series"]}),
+                    x_title="時間窗編號（每窗 1 秒訊號）",
+                    y_title="模型異常分數（0–1，1 = 完全不像正常）",
+                    y_domain=(0.0, 1.0), height=280),
+            use_container_width=True,
+        )
 
         st.subheader("判斷分布")
         vd = pd.DataFrame(
@@ -689,12 +926,12 @@ elif page == "即時診斷":
 
             # 顯示已生成的摘要（從 session_state 讀取）
             if summary_key in st.session_state:
+                # ⚠️ 這裡以前只是把換行換成 <br> 就塞進 div，等於把 LLM 回來的
+                # Markdown 當純文字印出來 —— 畫面上直接看到 `**目前狀況**`
+                # 這種語法（debug 清單第 14 點）。改用 T.note_panel，
+                # 它會先把 Markdown 轉成 HTML 再套面板樣式。
                 st.markdown(
-                    f"<div style='"
-                    f"background: #0d2137; border-left: 4px solid #22d3ee;"
-                    f"padding: 1rem 1.2rem; border-radius: 6px;"
-                    f"margin: 0.5rem 0; color: #dbeafe; line-height: 1.7;'"
-                    f">{st.session_state[summary_key].replace(chr(10), '<br>')}</div>",
+                    T.note_panel(st.session_state[summary_key]),
                     unsafe_allow_html=True,
                 )
                 if assistant.last_error:

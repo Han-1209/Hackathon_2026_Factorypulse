@@ -130,6 +130,11 @@ def snapshot(mode: str, minute: int | None = None) -> list[dict]:
             "fault_note": r["fault_note"],
             # 主模型在兩種模式下 key 不同（vibration / fused），用 primary_key 取
             "confidence": r["modality_detail"][r["primary_key"]]["confidence"],
+            # 信心度等級（高／中／低）。畫面一律顯示等級不顯示百分比 ——
+            # 理由見 confidence.py：模型機率在這個資料集上分不出對錯。
+            "confidence_level": r["confidence_verdict"]["level"],
+            "confidence_summary": r["confidence_verdict"]["summary"],
+            "model_is_holdout": r.get("model_is_holdout", False),
             "should_stop": r["should_stop"],
             "action_window": r["action_window"],
             "diagnosis": r,

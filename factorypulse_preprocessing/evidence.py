@@ -243,6 +243,89 @@ def extract(feature_row: dict, load_nm: float, top: int = 5,
     return rows[:top]
 
 
+def severity_series(feature_frame, load_nm: float, fault_type: str | None = None,
+                    reference: dict | None = None) -> dict | None:
+    """逐窗的「物理嚴重度」：每個時間窗實測值相對同負載正常基準的倍數。
+
+    為什麼需要這個（原本的趨勢圖畫錯東西了）
+    ----------------------------------------
+    「異常程度隨時間變化」原本畫的是分類器的 1 - P(正常)。那是**決策**不是**量測**，
+    而且樹模型在明確樣本上機率會飽和，畫出來是一條水平線。實測 4Nm_BPFO_30：
+
+        分類器異常分數   17 個窗全是 0.9999339，全距 0.000002（換成 log-odds 也只有 0.03）
+        包絡譜 BPFO 譜線 13.77× → 15.97×，變異係數 3.8%
+
+    同一批訊號，模型機率動也不動，物理量卻有真實起伏。設備健康監測要看的是
+    後者：它會隨負載、轉速、缺陷擴展而變化，而且不必相信模型就能自己核對。
+
+    挑哪一個特徵畫
+    --------------
+    優先選「支持模型結論、且偏離最大」的那個通道（例如判外環故障就畫 BPFO 譜線）。
+    判正常或找不到支持項時，退而畫偏離最大的那一項——正常機台看的就是
+    「所有物理量都貼著 1.0 倍」，那條線本身就是證據。
+
+    回傳 None 代表算不出來（沒有基準檔、或該負載沒有對應基準），呼叫端要能接受。
+    """
+    try:
+        ref = reference or load_reference()
+    except FileNotFoundError:
+        return None
+
+    key = str(int(load_nm))
+    if key not in ref["baseline"]:
+        key = sorted(ref["baseline"])[0]
+    base = ref["baseline"][key]
+
+    cols = [c for c in feature_frame.columns if c in base]
+    if not cols:
+        return None
+
+    median_row = feature_frame[cols].median(numeric_only=True).to_dict()
+    ranked = extract(median_row, load_nm=load_nm, top=8, reference=ref,
+                     fault_type=fault_type, dedup_by_feature=True)
+    if not ranked:
+        # 完全沒有超過 MIN_RATIO 的項目 -> 這台看起來正常。
+        # 挑一個代表性的軸承特徵來畫，讓「正常」也有一條線可以看。
+        for cand in ("ch0_env_BPFO", "ch1_env_BPFO", "ch0_order_1x"):
+            if cand in cols:
+                pick = {"feature": cand, "特徵種類": _split(cand)[1],
+                        "名稱": FEATURE_PHYSICS[_split(cand)[1]][0],
+                        "位置": CHANNEL_NAMES.get(_split(cand)[0], cand),
+                        "方向": "高於正常",
+                        "物理意義": FEATURE_PHYSICS[_split(cand)[1]][1]}
+                break
+        else:
+            return None
+    else:
+        supporting = [e for e in ranked if e.get("與結論一致", True)]
+        pick = (supporting or ranked)[0]
+
+    col = pick["feature"]
+    b = base[col]["median"]
+    if abs(b) < 1e-12:
+        return None
+
+    values = feature_frame[col].astype(float).to_numpy()
+    direction = FEATURE_PHYSICS[pick["特徵種類"]][2]
+    if direction == "low":
+        safe = values.copy()
+        safe[abs(safe) < 1e-12] = 1e-12
+        ratios = b / safe
+    else:
+        ratios = values / b
+
+    return {
+        "feature": col,
+        "名稱": pick["名稱"],
+        "位置": pick["位置"],
+        "方向": direction,
+        "物理意義": pick["物理意義"],
+        "正常基準": float(b),
+        "ratios": [float(v) for v in ratios],
+        "實測值": [float(v) for v in values],
+    }
+
+
 def format_for_llm(evidence: list[dict], shaft_freq: float = 50.15,
                    orders: dict | None = None) -> str:
     """把證據清單排版成注入 system prompt 的文字區塊。

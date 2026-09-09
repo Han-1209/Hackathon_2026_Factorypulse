@@ -78,7 +78,7 @@ flowchart TD
 - 不對心（Misalign）與不平衡（Unbalance）在跨負載測試中容易互相混淆，系統會主動揭露此辨識限制而非隱藏
 
 ## 執行方式
-
+  
 ```bash
 cd factorypulse_preprocessing
 pip install -r requirements.txt

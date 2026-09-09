@@ -44,6 +44,50 @@ CRIT = "#dc2626"
 HEALTH_CUT_OK = 70      # 對應風險 30，規則引擎的 healthy/attention 邊界
 HEALTH_CUT_BAD = 30     # 對應風險 70，規則引擎的 warning/high 邊界
 
+# 三階顏色帶的「顯示用文字」。全系統只有這一份，畫面上每個地方
+# （KPI 卡片、廠房圖圖例、分數條說明）都從這裡取，不各自手寫。
+# 之前圖例寫「正常 100–70」、分數條說明寫「綠 100~70」、KPI 又自己分了一組
+# 桶子，三邊的邊界對不起來，才會出現「綠色機台 1 台但 KPI 說 3 台」。
+#
+# 邊界說明（tone_color 用嚴格大於，所以是這個切法）：
+#   健康分數 71–100  ⟺ 風險 <30    -> 綠
+#   健康分數 31–70   ⟺ 風險 30–69  -> 黃
+#   健康分數 0–30    ⟺ 風險 ≥70    -> 紅
+BAND_OK = {"dot": "🟢", "name": "健康", "range": "71–100", "sub": "可持續運轉", "color": OK}
+BAND_WARN = {"dot": "🟡", "name": "注意・警告", "range": "31–70", "sub": "安排檢修", "color": WARN}
+BAND_BAD = {"dot": "🔴", "name": "高風險・危急", "range": "0–30", "sub": "立即處理", "color": BAD}
+BANDS = (BAND_OK, BAND_WARN, BAND_BAD)
+
+# 風險等級徽章（五級）-> 對應的三階顏色帶。徽章負責「精確是哪一級」，
+# 顏色負責「要不要動作」，兩者由這張表綁死，不會互相說反話。
+LEVEL_BAND = {
+    "健康": BAND_OK,
+    "注意": BAND_WARN,
+    "警告": BAND_WARN,
+    "高風險": BAND_BAD,
+    "危急": BAND_BAD,
+}
+
+# 五級徽章各自的健康分數區間（給畫面上的分級說明用）
+LEVEL_RANGE = {
+    "健康": "71–100",
+    "注意": "51–70",
+    "警告": "31–50",
+    "高風險": "16–30",
+    "危急": "0–15",
+}
+
+SCALE_NOTE = ("健康分數 = 100 − 風險分數。顏色三階："
+              f"{BAND_OK['dot']} {BAND_OK['range']} {BAND_OK['sub']}／"
+              f"{BAND_WARN['dot']} {BAND_WARN['range']} {BAND_WARN['sub']}／"
+              f"{BAND_BAD['dot']} {BAND_BAD['range']} {BAND_BAD['sub']}。")
+
+
+def level_dot(level: str) -> str:
+    """風險等級 -> 「🔴 危急」這種帶顏色圓點的顯示字串。"""
+    band = LEVEL_BAND.get(level)
+    return f"{band['dot']} {level}" if band else level
+
 
 def tone_color(score: float) -> str:
     """健康分數 -> 顏色。切點與風險等級邊界對齊，見上方說明。
@@ -228,7 +272,164 @@ def tag(text: str, color: str, filled: bool = True) -> str:
     return f'<span class="tag-out" style="color:{color};border-color:{color}">{text}</span>'
 
 
-def confidence(conf: float) -> str:
-    c = OK if conf >= 0.8 else (WARN if conf >= 0.6 else BAD)
+# ---------------------------------------------------------------- 信心度
+# 這裡原本叫「可信度」並顯示百分比，全廠 10 台清一色 100%，看起來像寫死的。
+# 它其實是逐窗多數決的一致率，而且實測證明它分不出對錯：跨負載測試裡
+# 唯一判錯的檔案一致率 96%，判對的那支反而只有 76%（詳見 confidence.py）。
+#
+# 現在信心度改由 confidence.assess() 依四條可檢核條件判定，只給等級不給百分比。
+# 這個模組只負責「等級 -> 顏色」，判定邏輯不在這裡。
+CONF_LEVEL_COLOR = {"高": OK, "中": WARN, "低": BAD}
+CONF_LEVEL_DOT = {"高": "🟢", "中": "🟡", "低": "🔴"}
+
+CONF_NOTE = ("信心度不是模型輸出的機率，而是四條可檢核條件（物理證據支持、"
+             "跨感測一致、逐窗穩定、非已知混淆對）的通過情形。"
+             "45 支錄音、每個故障條件僅一支，樣本數不足以校準出可靠的百分比，"
+             "因此只給等級。")
+
+
+def conf_color(level: str) -> str:
+    return CONF_LEVEL_COLOR.get(level, MUTED)
+
+
+def conf_dot(level: str) -> str:
+    """「🟢 高」這種帶顏色圓點的顯示字串。"""
+    return f"{CONF_LEVEL_DOT.get(level, '⚪')} {level}"
+
+
+def confidence(level: str, summary: str = "") -> str:
+    """信心度徽章。呼叫端自己加標籤文字，這裡只回傳「高（4/4 項條件成立）」。"""
+    c = conf_color(level)
+    extra = f"（{summary}）" if summary else ""
     return (f'<span class="mono" style="color:{c};font-size:13px;font-weight:700">'
-            f'CONF {conf:.0%}</span>')
+            f'{level}{extra}</span>')
+
+
+def check_list(checks: list[dict]) -> str:
+    """把四條件攤成一張可讀的清單。
+
+    信心度的重點不是那個等級，是「憑什麼」。把條件攤開來，
+    看的人可以自己判斷要不要相信，而不是被要求相信一個數字。
+    """
+    rows = []
+    for c in checks:
+        if c["passed"] is None:
+            mark, color = "—", MUTED
+        elif c["passed"]:
+            mark, color = "✓", OK
+        else:
+            mark, color = "✗", BAD
+        rows.append(
+            f'<div style="display:flex;gap:10px;align-items:flex-start;'
+            f'padding:7px 0;border-bottom:1px solid {LINE}">'
+            f'<span style="color:{color};font-weight:800;font-size:15px;'
+            f'line-height:1.3;min-width:16px">{mark}</span>'
+            f'<div><div style="color:{TEXT};font-size:13px;font-weight:600">'
+            f'{c["label"]}</div>'
+            f'<div style="color:{MUTED};font-size:12px;line-height:1.6">'
+            f'{c["detail"]}</div></div></div>'
+        )
+    return f'<div style="margin:4px 0 10px">{"".join(rows)}</div>'
+
+
+# ---------------------------------------------------------------- Markdown
+# LLM 回來的是 Markdown。原本的做法是把換行換成 <br> 後塞進 HTML div，
+# 結果 **粗體** 這類語法原封不動印在畫面上（見 debug 清單第 14 點）。
+# Streamlit 的 st.markdown 會渲染，但那樣就套不上這個面板的樣式，
+# 所以這裡自己做一層最小轉換：粗體、斜體、行內程式碼、標題、有序／無序清單。
+# 只支援 LLM 實際會用到的語法，不做完整 Markdown 剖析——需求就這麼多。
+import html as _html
+import re as _re
+
+_MD_BOLD = _re.compile(r"\*\*(.+?)\*\*")
+_MD_ITALIC = _re.compile(r"(?<!\*)\*(?!\s)([^*]+?)(?<!\s)\*(?!\*)")
+_MD_CODE = _re.compile(r"`([^`]+)`")
+_MD_BULLET = _re.compile(r"^\s*[-*・]\s+(.*)$")
+_MD_NUMBER = _re.compile(r"^\s*(\d+)[.)、]\s*(.*)$")
+_MD_HEADING = _re.compile(r"^\s*#{1,6}\s+(.*)$")
+
+
+def _md_inline(text: str) -> str:
+    # 先跳脫再套規則：跳脫不會動到 * 與 `，所以規則仍然對得上，
+    # 但使用者或 LLM 吐出來的 <script> 之類就進不了 DOM。
+    out = _html.escape(text)
+    out = _MD_CODE.sub(
+        lambda m: f'<code style="background:#0a1424;border:1px solid {LINE};'
+                  f'border-radius:3px;padding:0 4px;font-size:.92em">{m.group(1)}</code>',
+        out,
+    )
+    out = _MD_BOLD.sub(rf'<strong style="color:{TEXT}">\1</strong>', out)
+    out = _MD_ITALIC.sub(r"<em>\1</em>", out)
+    return out
+
+
+def md_to_html(text: str) -> str:
+    """把 LLM 的 Markdown 轉成這個主題用得上的 HTML 片段。"""
+    parts: list[str] = []
+    open_list: str | None = None
+
+    def close_list():
+        nonlocal open_list
+        if open_list:
+            parts.append(f"</{open_list}>")
+            open_list = None
+
+    def open_as(kind: str, start: int | None = None):
+        """開一個新清單。
+
+        ⚠️ start 是必要的。LLM 的摘要長這樣：
+
+            1. **目前狀況**：
+            （空行）
+            2. **最可能的原因**：
+
+        中間的空行會結束前一個 <ol>，下一個 <ol> 預設又從 1 開始 ——
+        畫面上就變成「1. 2. 3.」全部顯示成「1.」。把原本的數字帶進
+        start 屬性，編號才會跟 LLM 寫的一致。
+        """
+        nonlocal open_list
+        if open_list != kind:
+            close_list()
+            attr = f' start="{start}"' if kind == "ol" and start else ""
+            parts.append(f'<{kind}{attr} style="margin:4px 0 8px 1.2rem;padding:0">')
+            open_list = kind
+
+    for raw in (text or "").splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            close_list()
+            continue
+
+        m = _MD_HEADING.match(line)
+        if m:
+            close_list()
+            parts.append(f'<div style="font-weight:700;color:{ACCENT};'
+                         f'margin:12px 0 4px">{_md_inline(m.group(1))}</div>')
+            continue
+
+        m = _MD_BULLET.match(line)
+        if m:
+            open_as("ul")
+            parts.append(f"<li>{_md_inline(m.group(1))}</li>")
+            continue
+
+        m = _MD_NUMBER.match(line)
+        if m:
+            open_as("ol", start=int(m.group(1)))
+            parts.append(f"<li>{_md_inline(m.group(2))}</li>")
+            continue
+
+        close_list()
+        parts.append(f'<div style="margin:5px 0">{_md_inline(line)}</div>')
+
+    close_list()
+    return "".join(parts)
+
+
+def note_panel(md_text: str) -> str:
+    """LLM 摘要用的面板：左側青色實線 + 深底，內容以 Markdown 渲染。"""
+    return (
+        f'<div style="background:#0d2137;border-left:4px solid {ACCENT};'
+        f'padding:1rem 1.2rem;border-radius:6px;margin:0.5rem 0;'
+        f'color:{TEXT};line-height:1.75">{md_to_html(md_text)}</div>'
+    )

@@ -106,6 +106,18 @@ def _build_system_prompt(diag: dict) -> str:
     confidence = diag.get("confidence", None)
     confidence_str = f"{confidence:.0%}" if confidence is not None else "未知"
 
+    # 信心度區塊。沒有現成的判定就當場算一次，確保 LLM 拿到的等級
+    # 與畫面上顯示的完全一致（同一份 confidence.assess 的輸出）。
+    import confidence as _cf
+    _verdict = diag.get("confidence_verdict")
+    if not _verdict:
+        try:
+            _verdict = _cf.from_diagnosis(diag, diag.get("evidence"))
+        except Exception:
+            _verdict = None
+    confidence_block = (_cf.format_for_llm(_verdict) if _verdict
+                        else "  （本次未提供信心度判定）")
+
     should_stop = diag.get("should_stop", False)
     action_window = diag.get("action_window", "—")
     triggered_rules = diag.get("triggered_rules", [])
@@ -161,14 +173,22 @@ def _build_system_prompt(diag: dict) -> str:
 不可以只講一般性的故障原理。證據已依偏離正常的倍數排序，請以最前面幾項為主要依據。
 8. 【量測證據】沒有列出的現象，一律不得聲稱有觀察到。例如證據裡沒有提到邊帶，\
 就不可以說「發現邊帶」；沒有提到溫度，就不可以說「溫度上升」。
+9. 講到信心度時只能引用【信心度】區塊的等級與四個條件，不可以自己換算成百分比。\
+「逐窗一致率」是模型在不同時間窗給出相同答案的比例，**不是**準確率也不是信心度，\
+不可以把它講成「可信度」「準確率」或「信心水準」。\
+若信心度等級是「中」或「低」，回答中必須明確建議複檢，不可以只講結論。
+10. 不要在回答裡使用 Markdown 的表格與程式碼區塊；粗體與清單可以用。
 
 【當前診斷結果】
 - 研判故障：{fault_display_name}
 - 風險等級：{risk_level}
 - 異常機率：{anomaly_str}
-- 判斷可信度：{confidence_str}
+- 逐窗一致率：{confidence_str}（僅供參考，不是準確率也不是信心度）
 - 建議停機：{"是，請盡快安排" if should_stop else "否，可繼續運轉但需監測"}
 - 建議處理時限：{action_window}
+
+【信心度】（由四條可檢核條件判定，不是模型輸出的機率）
+{confidence_block}
 
 【量測證據】（本台設備實際量到的數值，與「同負載下正常機台」基準的比較）
 {evidence_text}
