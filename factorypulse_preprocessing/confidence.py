@@ -153,7 +153,8 @@ def _check_confusion(known_confusion: str) -> dict:
 def assess(*, evidence: list[dict] | None, fault_type: str,
            agreement: float, n_windows: int,
            cross_sensor: tuple[float, float] | None,
-           known_confusion: str = "", overrode: str | None = None) -> dict:
+           known_confusion: str = "", overrode: str | None = None,
+           has_physical_baseline: bool = True) -> dict:
     """回傳 {level, checks, passed, applicable, summary, note}。
 
     overrode: 物理閘門推翻分類器結論時，傳入分類器原本的答案。
@@ -161,6 +162,13 @@ def assess(*, evidence: list[dict] | None, fault_type: str,
         （4Nm_Unbalance_0583mg）物理偏離只有 1.0 倍，被閘門判成正常。
         那是漏報，而「高信心的漏報」是預測維護裡最貴的一種錯誤。
         這種情況一律壓到「中」，並在畫面上標明兩層不一致。
+
+    has_physical_baseline: 這個模式有沒有「同運轉條件的正常基準」可比。
+        ⚠️ 沒有基準時這一條必須標成「不適用」，不能算通過。變轉速模式就是這種情況
+        （evidence_reference.json 只由變負載資料集產生），照原本的寫法會因為證據
+        清單是空的而回報「各項頻譜特徵皆在正常基準範圍內」—— 那是一句系統根本
+        沒做過的檢查，是這裡最不能犯的錯。
+        少了這條不經模型的獨立佐證，等級一律封頂在「中」。
     """
     checks = [
         _check_physical(evidence or [], fault_type),
@@ -168,7 +176,14 @@ def assess(*, evidence: list[dict] | None, fault_type: str,
         _check_stability(agreement, n_windows),
         _check_confusion(known_confusion),
     ]
-    if overrode:
+    if not has_physical_baseline:
+        checks[0] = dict(
+            key="physical", label="物理證據支持", passed=None,
+            detail=("此模式沒有「同運轉條件的正常基準」可比對（基準檔只由變負載"
+                    "資料集產生），因此無法做不經模型的物理驗證。"
+                    "少了這條獨立佐證，信心度最高只能到「中」。"),
+        )
+    elif overrode:
         checks[0] = dict(
             key="physical", label="物理證據支持", passed=None,
             detail=(f"分類器判為「{overrode}」，但頻譜上各項特徵都在同負載正常基準"
@@ -187,6 +202,9 @@ def assess(*, evidence: list[dict] | None, fault_type: str,
     #   中 —— 其餘
     if agreement < AGREEMENT_SHAKY:
         level = "低"
+    elif not has_physical_baseline:
+        # 沒有不經模型的獨立佐證，就不可能是「高」
+        level = "中" if len(passed) == len(applicable) else "低"
     elif overrode:
         # 兩層不一致：不可能是「高」，也不該是「低」（物理層有明確依據）
         level = "中"
