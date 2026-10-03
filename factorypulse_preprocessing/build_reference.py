@@ -30,8 +30,12 @@ OUT = Path("./results/evidence_reference.json")
 
 
 def main():
+    # ⚠️ 基準只用 train 段（每支錄音時間最早的 70%）。
+    # 原本三段都算進去，受測的 test 段也成了基準的一部分——正常機台等於
+    # 拿自己跟自己比，物理閘門對它永遠回答「在基準內」。
+    # 只用最早的時段，對應實際部署：基準來自設備裝機時健康狀態的紀錄。
     dfs = []
-    for split in ["train", "val", "test"]:
+    for split in ["train"]:
         p = config.OUTPUT_DIR / f"vibration_v2_features_{split}.csv"
         if not p.exists():
             raise SystemExit(f"找不到 {p}，請先執行 build_dataset.py")
@@ -56,7 +60,8 @@ def main():
         raise SystemExit("特徵檔裡沒有 Normal 樣本，無法建立基準")
 
     ref = {
-        "note": "由 Normal 檔案逐負載算出的基準值，供證據層計算『幾倍於正常』",
+        "note": "由 Normal 檔案的 train 段（時間最早的 70%）逐負載算出的基準值，"
+                "供證據層計算『幾倍於正常』；受測的 val/test 段不參與",
         "shaft_freq_hz": 50.15,
         "bearing_orders": dict(v2.BEARING_ORDERS),
         "n_features": len(cols),

@@ -117,6 +117,11 @@ def normal_temp_baseline(entries: list[dict]) -> dict:
         temps = io_utils.load_current_temp_tdms(Path(e["current_temp_path"]))
         temp_1hz_a = features_temperature.resample_to_seconds(temps["temperature_A"], temps["fs"])
         temp_1hz_b = features_temperature.resample_to_seconds(temps["temperature_B"], temps["fs"])
+        # ⚠️ 只用 train 段（時間最早的部分）當基準。用整段的話，受測的
+        # val/test 段也算在基準裡，正常機台的溫差會被硬拉成 0（自己跟自己比）。
+        frac = e.get("split_ratio", {}).get("train", 0.7)
+        temp_1hz_a = temp_1hz_a[: max(1, int(len(temp_1hz_a) * frac))]
+        temp_1hz_b = temp_1hz_b[: max(1, int(len(temp_1hz_b) * frac))]
         baseline[e["load_nm"]] = {
             "A": float(np.mean(temp_1hz_a)),
             "B": float(np.mean(temp_1hz_b)),

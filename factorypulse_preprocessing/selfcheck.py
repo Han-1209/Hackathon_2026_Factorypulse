@@ -97,14 +97,18 @@ def block_a():
 
     def a2():
         src = dd.vibration_source("load")
-        b = dd.load_model("load", "vibration")
-        n_model = len(b["feature_names"])
         X, _, _ = fs.load_features("test", src)
-        missing = [c for c in b["feature_names"] if c not in X.columns]
-        if missing:
-            log(f"         模型需要但特徵檔沒有：{missing[:5]}")
-            return False
-        return f"{src} / 模型 {n_model} 欄，特徵檔涵蓋 100%"
+        # 儀表板實際用的是三個 LOLO 模型，三個都要對得上特徵檔
+        for L in (0, 2, 4):
+            b = dd.load_model_for("load", "vibration", L)
+            if b.get("held_out") != L:
+                log(f"         找不到排除 {L} Nm 的 LOLO 模型，退回了舊模型")
+                return False
+            missing = [c for c in b["feature_names"] if c not in X.columns]
+            if missing:
+                log(f"         LOLO {L} Nm 模型需要但特徵檔沒有：{missing[:5]}")
+                return False
+        return f"{src} / 三個 LOLO 模型各 {len(b['feature_names'])} 欄，特徵檔涵蓋 100%"
 
     def a3():
         bad = []
@@ -282,14 +286,18 @@ def block_c():
         return f"manifest {len(m)} 筆，欄位 {list(m.columns)[:6]}"
 
     def c5():
-        b = dd.load_model("speed", "fused")
-        return (f"融合模型 {len(b['feature_names'])} 欄，"
+        # 儀表板用的是 7 個 leave-one-profile-out 模型，每個都要在
+        for p in dd.HOLDOUT_KEYS["speed"]:
+            b = dd.load_model_for("speed", "fused", p)
+            if b.get("held_out") != p:
+                return False
+        return (f"7 個 LOPO 融合模型各 {len(b['feature_names'])} 欄，"
                 f"類別 {b['classes']}，"
                 f"特徵版本 {b.get('feature_version', 'v1（無標記）')}")
 
     def c6():
         src = dd.vibration_source("speed")
-        b = dd.load_model("speed", "fused")
+        b = dd.load_model_for("speed", "fused")
         X, _, _ = dd.split_features("speed", "fused", "test")
         missing = [c for c in b["feature_names"] if c not in X.columns]
         if missing:
@@ -345,13 +353,16 @@ def block_d():
     ok, msg = la.check_availability()
     log(f"  LLM 可用性：{msg}")
 
-    v = pd.concat([pd.read_csv(config.OUTPUT_DIR / f"vibration_v2_features_{s}.csv")
-                   for s in ["train", "val", "test"]], ignore_index=True)
-    row = v[(v.condition == "BPFO") & (v.load_nm == 4)].median(numeric_only=True).to_dict()
+    # 用單一錄音（4Nm_BPFO_30）的 test 段，與儀表板口徑一致：
+    # 正常基準取自 train 段，受測資料不能跟基準重疊。
+    v = pd.read_csv(config.OUTPUT_DIR / "vibration_v2_features_test.csv")
+    g = v[v.file_id == "4Nm_BPFO_30"]
+    row = g.median(numeric_only=True).to_dict()
     info = kb.get_fault_info("BPFO")
     diag = {
         "fault_type": "BPFO", "fault_label": info["display"],
         "risk_level_display": "高風險", "anomaly_prob": 0.94, "confidence": 0.97,
+        "n_windows": int(len(g)),     # 少了這個，信心度會誤判成「0 個時間窗、樣本太短」
         "should_stop": False, "action_window": "24 小時內",
         "triggered_rules": ["R1 振動明確異常", "R8 需人工複檢"],
         "load_nm": 4, "evidence_features": row,

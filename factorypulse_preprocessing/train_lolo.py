@@ -165,6 +165,10 @@ def audit_confidence(runs: dict) -> pd.DataFrame:
         ni = classes.index("Normal") if "Normal" in classes else None
 
         for fid, g in m_te.groupby("file_id"):
+            # 只稽核 test 段：正常基準取自 train 段，若把 train 段也拿來稽核，
+            # 正常錄音等於跟自己比。也與儀表板（只讀 test 段）一致。
+            if "split" in g.columns:
+                g = g[g.split == "test"]
             idx = g.index.values
             pp = proba[idx]
             labels = [classes[i] for i in pp.argmax(1)]

@@ -58,7 +58,9 @@ def main():
     step("1. 檢查模型與特徵版本")
     try:
         src = dd.vibration_source(mode)
-        bundle = dd.load_model(mode, "vibration")
+        # 測試檔是 4Nm，所以用沒看過 4Nm 的 LOLO 模型（與儀表板相同）
+        bundle = dd.load_model_for(mode, "vibration", 4)
+        print(f"  使用模型：沒看過 {bundle.get('held_out')} Nm 的 LOLO 模型")
         print(f"  vibration_source(load) = {src}")
         print(f"  model feature_version  = {bundle.get('feature_version')}")
         print(f"  模型需要 {len(bundle['feature_names'])} 個特徵")

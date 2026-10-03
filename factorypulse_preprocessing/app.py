@@ -68,7 +68,7 @@ st.sidebar.markdown("---")
 
 try:
     _primary = dd.primary_modality(mode)
-    _classes = dd.load_model(mode, _primary)["classes"]
+    _classes = dd.load_model_for(mode, _primary)["classes"]
     _n_class = f"{len(_classes)} 種狀態（{'、'.join(dd.fault_display(c) for c in _classes)}）"
     _models_ready = True
 except FileNotFoundError:
@@ -181,21 +181,14 @@ if page == "廠區總覽":
         unsafe_allow_html=True,
     )
 
-    # 模型來源橫幅。這是整個畫面最需要主動說清楚的一件事：
-    # 舊版用的是同錄音切分訓練的模型，那組數字《數字口徑表》明文不可對外。
-    if mode == "load":
-        if dd.lolo_available():
-            st.success(
-                "**畫面上每一台的診斷，都來自沒看過那個負載的模型。**　"
-                "每台機台使用 leave-one-load-out 模型（0/2/4 Nm 各訓練一個，"
-                "各自排除自己那個負載），因此不存在「同一支錄音同時出現在訓練與測試」的問題。"
-            )
-        else:
-            st.error(
-                "**目前使用的是同錄音切分訓練的模型**，其數字依《數字口徑表》不可對外引用"
-                "（畫面上會出現一片 100% 的可信度）。請先執行 `python train_lolo.py` "
-                "產生 leave-one-load-out 模型，重啟後即會自動切換。"
-            )
+    # 模型來源橫幅：每台機台都由「沒看過它那個運轉條件」的模型判斷
+    st.success(
+        "**畫面上每一台的診斷，都來自沒看過那個運轉條件的模型。**　"
+        + ("0／2／4 Nm 各訓練一個模型，各自排除自己那個負載。"
+           if mode == "load" else
+           "7 條轉速曲線各訓練一個模型，各自排除自己那條曲線。")
+        + "同一支錄音不會同時出現在訓練與測試。"
+    )
 
     with st.spinner("讀取各機台感測資料..."):
         snap = cached_snapshot(mode, minute)
@@ -527,22 +520,18 @@ elif page == "多感測證據":
     )
 
     # ---- 這個結論是哪個模型做出來的 ----
-    scope = r.get("model_scope", {}).get(r["primary_key"])
+    scope = r.get("model_holdout")
     if scope is not None:
-        bundle = dd.load_lolo(r["primary_key"], scope)
+        bundle = dd.load_model_for(mode, r["primary_key"], scope)
         acc = bundle.get("holdout_accuracy")
         f1 = bundle.get("holdout_macro_f1")
+        trained_on = bundle.get("training_loads") or bundle.get("training_profiles") or []
         st.success(
-            f"**這台機台的判斷來自「沒看過 {scope} Nm」的模型。**　"
-            f"訓練資料為 {'、'.join(f'{l} Nm' for l in bundle['training_loads'])}"
-            f"（{bundle['n_train']:,} 個時間窗），{scope} Nm 完全排除在訓練之外。"
-            + (f"　該模型在這個保留負載上的逐窗準確率 {acc:.1%}、macro-F1 {f1:.1%}。"
+            f"**這台機台的判斷來自「沒看過 {dd.holdout_label(mode, scope)}」的模型。**　"
+            f"訓練資料為 {'、'.join(dd.holdout_label(mode, t) for t in trained_on)}"
+            f"（{bundle['n_train']:,} 個時間窗），{dd.holdout_label(mode, scope)} 完全排除在訓練之外。"
+            + (f"　該模型在這個保留條件上的逐窗準確率 {acc:.1%}、macro-F1 {f1:.1%}。"
                if acc is not None else "")
-        )
-    elif mode == "load":
-        st.error(
-            "**這個結論來自看過同一支錄音的模型**，依《數字口徑表》不可對外引用。"
-            "請執行 `python train_lolo.py` 後重啟。"
         )
 
     st.subheader("信心度依據")
@@ -621,7 +610,9 @@ elif page == "多感測證據":
             "感測位置": e["位置"],
             "實測值": e["實測值"],
             "正常基準": e["正常基準"],
-            "倍數": f"{e['倍數']}×",
+            # 「越低越異常」的量測（邊帶比）顯示成 1/N，避免「實測比基準小卻寫 N 倍」
+            "相對正常": (f"{e['倍數']}×" if e.get("方向", "高於正常") == "高於正常"
+                       else f"1/{e['倍數']}（越低越異常）"),
         } for e in r["physical_evidence"]])
         st.dataframe(pe, hide_index=True, use_container_width=True)
 
@@ -657,7 +648,8 @@ elif page == "多感測證據":
 
     with right:
         st.subheader("這個模型最看重哪些特徵")
-        imp = dd.feature_importance(mode, dd.primary_modality(mode), top=10)
+        imp = dd.feature_importance(mode, dd.primary_modality(mode), top=10,
+                                    held_out=r.get("model_holdout"))
         if not imp.empty:
             # 同樣改橫向：`ch3_env_BPFO_sideband` 這種長特徵名，
             # 直向長條圖只能塞進 `ch3_env_BPFO_s...`，看不出是哪個特徵。
@@ -669,7 +661,7 @@ elif page == "多感測證據":
                 use_container_width=True,
             )
             st.caption(
-                "直接取自當前模式的模型。ch0~ch3 分別是軸承座 A/B 的 x/y 方向振動。"
+                "直接取自做出這台判斷的那個模型（沒看過這台運轉條件的那一個）。ch0~ch3 分別是軸承座 A/B 的 x/y 方向振動。"
                 "`env_BPFO` / `env_BPFI` 是包絡譜在軸承內外環特徵頻率的譜線強度，"
                 "`order_1x` / `ratio_3x_1x` 是轉頻諧波與諧波比，"
                 "`kurtosis` 是波形峰度（對週期性衝擊敏感）。"
@@ -708,7 +700,7 @@ elif page == "即時診斷":
             "LIVE ANALYSIS · 即時診斷",
             "上傳原始感測檔，系統自動轉換並判斷",
             dd.MODE_LABELS[mode],
-            "使用當前運轉模式的模型",
+            "使用沒看過該運轉條件的模型",
         ),
         unsafe_allow_html=True,
     )
@@ -726,6 +718,7 @@ elif page == "即時診斷":
 
     X = None
     src_note = ""
+    live_hold = None     # 這段訊號的運轉條件（負載或轉速曲線），用來挑沒看過它的模型
 
     with tab_up:
         # 模型訓練時把運轉條件（負載）當成特徵——負載對訊號的影響比故障還大，
@@ -761,6 +754,8 @@ elif page == "即時診斷":
                     st.json(res["temperature"])
                 st.stop()
             X = res["features"]
+            live_hold = up_load if mode == "load" else (
+                float(X["profile"].iloc[0]) if "profile" in X.columns else None)
             src_note = f"{up.name}（{res['n_windows']} 個時間窗）"
 
     with tab_demo:
@@ -771,14 +766,19 @@ elif page == "即時診斷":
         if st.checkbox("載入這台機台的資料", value=False):
             machine = sim.machine_by_id(mode, mid)
             Xall, _, meta = dd.split_features(mode, dd.primary_modality(mode), "test")
-            X = Xall[(meta.file_id == machine.source).values]
+            _mask = (meta.file_id == machine.source).values
+            X = Xall[_mask]
+            _hc = "load_nm" if mode == "load" else "profile"
+            if _hc in meta.columns:
+                live_hold = float(meta.loc[_mask, _hc].iloc[0])
             src_note = f"{mid} {machine.name}（{len(X)} 個時間窗）"
             st.info(f"已載入 {src_note}")
 
     if X is not None and len(X):
         st.markdown("---")
         if st.button("開始診斷", type="primary"):
-            bundle = dd.load_model(mode, dd.primary_modality(mode))
+            # 與「設備診斷」頁同一套規則：用沒看過這個運轉條件的模型
+            bundle = dd.load_model_for(mode, dd.primary_modality(mode), live_hold)
             missing = [c for c in bundle["feature_names"] if c not in X.columns]
             if missing:
                 st.error(
@@ -796,6 +796,8 @@ elif page == "即時診斷":
             st.session_state["live_diag_result"] = res
             st.session_state["live_diag_llm"] = dd.build_llm_diag(mode, res, X)
             st.session_state["live_diag_src_note"] = src_note
+            st.session_state["live_diag_scope"] = (bundle.get("held_out")
+                                                   if live_hold is not None else None)
 
     # ── 從 session_state 讀取診斷結果來顯示 ──────────────────────────
     # 這段放在 st.button 外面，這樣 chat_input 觸發 rerun 時結果仍然顯示。
@@ -807,14 +809,25 @@ elif page == "即時診斷":
 
         st.markdown("---")
         st.subheader(f"診斷結果　—　{src_note_display}")
+        _scope = st.session_state.get("live_diag_scope")
+        if _scope is not None:
+            _lb = dd.holdout_label(mode, _scope)
+            st.caption(f"此結果來自「沒看過 {_lb}」的模型，{_lb} 的資料完全沒有參與這個模型的訓練。")
+        _llm = st.session_state.get("live_diag_llm") or {}
+        if _llm.get("gate_overrode"):
+            st.info(f"分類器判為「{_llm['gate_overrode']}」，但頻譜上各項特徵都在同負載正常基準"
+                    f"範圍內，找不到支持它的證據，因此依基準判定為正常。")
         ap = res["anomaly_prob"]
         st.markdown(
             T.kpi_row([
-                dict(label="異常機率", value=f"{ap:.0%}",
+                dict(label="分類器異常機率" if _llm.get("gate_overrode") else "異常機率",
+                     value=f"{ap:.0%}",
                      sub="1 - P(正常) 的中位數",
                      tone=T.tone_color((1 - ap) * 100)),
-                dict(label="研判故障", value=dd.fault_display(res["fault_type"]),
-                     sub="逐窗多數決", tone=T.ACCENT),
+                dict(label="研判故障",
+                     value=dd.fault_display(_llm.get("fault_type", res["fault_type"])),
+                     sub=("物理閘門推翻分類器" if _llm.get("gate_overrode")
+                          else "逐窗多數決"), tone=T.ACCENT),
                 dict(label="信心度", value=live_verdict["level"],
                      sub=live_verdict["summary"],
                      tone=T.conf_color(live_verdict["level"])),

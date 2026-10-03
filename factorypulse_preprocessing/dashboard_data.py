@@ -101,40 +101,75 @@ LOLO_TAG = {"vibration": "vib", "current": "cur"}
 USABLE_MIN_AUC = 0.70
 
 
-@lru_cache(maxsize=16)
-def load_lolo(modality: str, held_out_load: int) -> dict | None:
-    """載入排除某個負載的模型。找不到就回 None，讓呼叫端退回原模型。"""
-    tag = LOLO_TAG.get(modality)
-    if tag is None:
-        return None
-    path = MODELS_DIR / f"model_{tag}_lolo_{int(held_out_load)}.pkl"
-    if not path.exists():
-        return None
+# 每個模式「輪流排除」的運轉條件：
+#   load  -> 排除一種負載（leave-one-load-out，0/2/4 Nm 各一個模型）
+#   speed -> 排除一條轉速曲線（leave-one-profile-out，曲線 0~6 各一個模型）
+# 儀表板上每台機台，一律用「沒看過它那個運轉條件」的模型判斷，
+# 不再退回同錄音切分訓練的舊模型（那種模型等於背答案）。
+HOLDOUT_KEYS = {"load": (0, 2, 4), "speed": (0, 1, 2, 3, 4, 5, 6)}
+HOLDOUT_SCRIPT = {"load": "train_lolo.py", "speed": "train_speed_lopo.py"}
+
+
+def holdout_path(mode: str, modality: str, held_out: int) -> Path | None:
+    if mode == "load":
+        tag = LOLO_TAG.get(modality)
+        return MODELS_DIR / f"model_{tag}_lolo_{int(held_out)}.pkl" if tag else None
+    if mode == "speed" and modality == "fused":
+        return MODELS_DIR / f"model_speed_lopo_{int(held_out)}.pkl"
+    return None
+
+
+def holdout_label(mode: str, held_out) -> str:
+    """畫面用的說法：「0 Nm」或「轉速曲線 3」。"""
+    if held_out is None:
+        return "—"
+    return f"{int(held_out)} Nm" if mode == "load" else f"轉速曲線 {int(held_out)}"
+
+
+@lru_cache(maxsize=32)
+def _load_holdout(mode: str, modality: str, held_out: int) -> dict:
+    path = holdout_path(mode, modality, held_out)
+    if path is None or not path.exists():
+        name = path.name if path is not None else f"{mode}/{modality}"
+        raise FileNotFoundError(
+            f"找不到模型 {name}。請先執行 python {HOLDOUT_SCRIPT[mode]}")
     with open(path, "rb") as f:
-        return pickle.load(f)
+        bundle = pickle.load(f)
+    bundle["held_out"] = int(held_out)
+    return bundle
 
 
-@lru_cache(maxsize=1)
-def lolo_available() -> bool:
-    """三個負載的振動模型是否都齊了。畫面用它決定要不要顯示警告橫幅。"""
-    return all(load_lolo("vibration", l) is not None for l in (0, 2, 4))
+def load_lolo(modality: str, held_out_load: int) -> dict | None:
+    """（相容舊呼叫）載入排除某個負載的模型，找不到回 None。"""
+    try:
+        return _load_holdout("load", modality, int(held_out_load))
+    except FileNotFoundError:
+        return None
 
 
-def load_model_for(mode: str, modality: str, load_nm: float | None = None) -> dict:
-    """取得該用哪個模型。
+def lolo_available(mode: str = "load") -> bool:
+    """這個模式的主模型是否每個運轉條件都齊了。"""
+    modality = "vibration" if mode == "load" else "fused"
+    return all(holdout_path(mode, modality, h) is not None
+               and holdout_path(mode, modality, h).exists()
+               for h in HOLDOUT_KEYS[mode])
 
-    變負載模式且該負載有對應的 LOLO 模型時優先用它（模型沒看過這個負載）；
-    否則退回原本的模型，並在 bundle 裡標記 held_out_load=None，
-    讓畫面可以誠實顯示「這個結果來自看過同錄音的模型」。
+
+def load_model_for(mode: str, modality: str, held_out=None) -> dict:
+    """取得「沒看過這個運轉條件」的模型。
+
+    held_out：變負載模式是負載（Nm），變轉速模式是轉速曲線編號。
+    不知道運轉條件時（例如只是要讀類別清單），用第一個模型代表——
+    同一模式的幾個模型類別與特徵欄位完全相同。
+    找不到就直接報錯，不退回同錄音切分訓練的舊模型。
     """
-    if mode == "load" and load_nm is not None:
-        bundle = load_lolo(modality, int(round(load_nm)))
-        if bundle is not None:
-            return bundle
-    return load_model(mode, modality)
+    keys = HOLDOUT_KEYS[mode]
+    h = keys[0] if held_out is None else int(round(float(held_out)))
+    if h not in keys:
+        h = keys[0]
+    return _load_holdout(mode, modality, h)
 
 
-@lru_cache(maxsize=8)
 def load_model(mode: str, modality: str) -> dict:
     fname = MODE_SPEC[mode]["models"].get(modality)
     if fname is None:
@@ -169,7 +204,8 @@ def vibration_source(mode: str) -> str:
         if modality not in spec["models"]:
             continue
         try:
-            bundle = load_model(mode, modality)
+            # 看儀表板實際用的那批模型（同一模式的幾個模型特徵欄位相同）
+            bundle = load_model_for(mode, modality)
         except FileNotFoundError:
             continue
         if bundle.get("feature_version") == "v2":
@@ -308,14 +344,17 @@ def infer_modality(bundle: dict, X: pd.DataFrame) -> dict:
     }
 
 
-def feature_importance(mode: str, modality: str = "vibration", top: int = 10) -> pd.DataFrame:
+def feature_importance(mode: str, modality: str = "vibration", top: int = 10,
+                       held_out=None) -> pd.DataFrame:
     """直接從模型物件取特徵重要度。
 
     不從 results/importance_*.csv 讀，是因為那些檔案只有變負載資料集有，
     變轉速模式若共用同一個檔案會顯示錯誤的重要度。
     從模型本身取一定對應到當下選的模式，不會出錯。
     """
-    bundle = load_model(mode, modality)
+    # 用「做出這台判斷的那個模型」：變負載模式依負載挑 LOLO 模型，
+    # 否則畫面上的重要度會來自另一個（看過同錄音的）模型，前後對不上。
+    bundle = load_model_for(mode, modality, held_out)
     model = bundle["model"]
     if not hasattr(model, "feature_importances_"):
         return pd.DataFrame(columns=["feature", "importance"])
@@ -402,18 +441,70 @@ def build_llm_diag(mode: str, res: dict, X: pd.DataFrame) -> dict:
         except (FileNotFoundError, ImportError):
             pass
 
+    # ---- 物理閘門：與「設備診斷」頁同一套規則（先偵測、再診斷）----
+    #   quiet -> 頻譜各項都在同負載正常基準內：推翻分類器，判為正常
+    #   mild  -> 只有輕度偏離：保留故障名稱，但最多到「警告」，不建議停機
+    #   clear -> 不動
+    # 沒有這一步的話，同一台機器在「設備診斷」頁是正常、在這一頁卻是故障。
+    diag["gate_overrode"] = None
+    gate = physical_gate(diag["evidence"]) if has_baseline else "unknown"
+    diag["physical_gate"] = gate
+    if gate == "quiet" and fault != "Normal":
+        n_info = kb.get_fault_info("Normal")
+        lv = kb.RISK_ACTIONS["healthy"]
+        diag.update({
+            "gate_overrode": fault_display(fault),
+            "fault_type": "Normal",
+            "fault_label": n_info.get("display", "Normal"),
+            "risk_level_display": lv["display"],
+            "action_window": lv["window"],
+            "should_stop": False,
+            "causes": n_info.get("causes", []), "checks": n_info.get("checks", []),
+            "actions": n_info.get("actions", []), "tools": n_info.get("tools", []),
+            "parts": n_info.get("parts", []), "safety": n_info.get("safety", []),
+            "effort": n_info.get("effort", ""),
+            "known_confusion": n_info.get("known_confusion", ""),
+        })
+        diag["triggered_rules"] = [
+            f"R0 物理基準比對：各項頻譜特徵均在同負載正常基準範圍內，依基準判定為正常"
+            f"（分類器判為「{fault_display(fault)}」，但頻譜上找不到支持它的譜線，不予採信）"
+        ] + diag["triggered_rules"]
+        diag["severity_series"] = None
+    elif gate == "mild" and risk in ("高風險", "危急"):
+        top = max(e["倍數"] for e in diag["evidence"])
+        lv = kb.RISK_ACTIONS["warning"]
+        diag.update({"risk_level_display": lv["display"],
+                     "action_window": lv["window"], "should_stop": False})
+        diag["triggered_rules"] = [
+            f"R0 物理基準比對：最大偏離為同負載正常基準的 {top:.1f} 倍，屬輕度偏離，"
+            f"風險上限設為「{lv['display']}」（排程檢查而非立即停機）"
+        ] + diag["triggered_rules"]
+
     # 信心度與「設備診斷」頁走同一套判定，避免同一台機器在兩頁看到不同等級
     import confidence as _cf
     diag["confidence_verdict"] = _cf.assess(
         evidence=diag["evidence"],
-        fault_type=fault,
+        fault_type=diag["fault_type"],
         agreement=float(res.get("confidence", 0.0)),
         n_windows=int(res.get("n_windows", 0)),
         cross_sensor=None,      # 上傳的檔案只有單一模態
-        known_confusion=info.get("known_confusion", ""),
+        known_confusion=diag["known_confusion"],
+        overrode=diag["gate_overrode"] and fault,
         has_physical_baseline=has_baseline,
     )
     return diag
+
+
+@lru_cache(maxsize=2)
+def _temp_baseline_train(mode: str) -> dict:
+    """{負載: (A 基準溫度, B 基準溫度)}，取自 Normal 錄音的 train 段（時間最早的 70%）。"""
+    try:
+        df = _read_features(mode, "temperature", "train")
+    except FileNotFoundError:
+        return {}
+    n = df[df.condition == "Normal"]
+    return {int(round(l)): (float(g.A_temp_mean.mean()), float(g.B_temp_mean.mean()))
+            for l, g in n.groupby("load_nm")}
 
 
 def get_temperature(mode: str, file_id: str, split: str):
@@ -428,8 +519,18 @@ def get_temperature(mode: str, file_id: str, split: str):
     if row.empty:
         return 0.0, 0.0
     r = row.iloc[0]
-    delta = float(np.mean([r.get("A_temp_delta_from_baseline_mean", 0.0),
-                           r.get("B_temp_delta_from_baseline_mean", 0.0)]))
+    # 溫差基準改用「同負載正常機台錄音的最前段（train 段）」，不用整段錄音。
+    # 原本前處理把整段正常錄音的平均當基準，受測的那一段也算在基準裡，
+    # 正常機台的溫差因此被硬拉成 0——等於自己跟自己比。
+    # 改成只用較早的時段，對應實際部署：基準來自設備過去健康時的紀錄。
+    base = _temp_baseline_train(mode)
+    lk = int(round(float(r.get("load_nm", 0.0))))
+    if lk in base:
+        delta = float(np.mean([r["A_temp_mean"] - base[lk][0],
+                               r["B_temp_mean"] - base[lk][1]]))
+    else:
+        delta = float(np.mean([r.get("A_temp_delta_from_baseline_mean", 0.0),
+                               r.get("B_temp_delta_from_baseline_mean", 0.0)]))
     slope = float(np.mean([r.get("A_temp_trend_slope", 0.0),
                            r.get("B_temp_trend_slope", 0.0)]))
     return delta, slope
@@ -473,8 +574,11 @@ def diagnose(mode: str, file_id: str, split: str = "test",
 
         # ⚠️ 模型要先知道負載才能挑：這台機台的診斷必須由「沒看過這個負載」
         # 的模型做出來，否則畫面上的數字就是《數字口徑表》禁止對外的那一類。
-        bundle = load_model_for(mode, modality, cond_value)
-        model_scope[modality] = bundle.get("held_out_load")
+        hold_col = "load_nm" if mode == "load" else "profile"
+        hold_value = (float(meta.loc[mask, hold_col].iloc[0])
+                      if hold_col in meta.columns else None)
+        bundle = load_model_for(mode, modality, hold_value)
+        model_scope[modality] = bundle.get("held_out")
         detail[modality] = infer_modality(bundle, Xf)
 
         # 跨負載站不住腳的模態，只留著顯示，不讓它進風險計算（見 USABLE_MIN_AUC）
@@ -645,6 +749,7 @@ def diagnose(mode: str, file_id: str, split: str = "test",
 
     out.update({
         "model_scope": model_scope,
+        "model_holdout": model_scope.get(primary_key),
         "model_is_holdout": model_scope.get(primary_key) is not None,
         "equipment_id": file_id,
         "mode": mode,

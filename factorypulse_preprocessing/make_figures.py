@@ -58,11 +58,9 @@ MEASURES = [
 
 
 def load_features() -> pd.DataFrame:
-    return pd.concat(
-        [pd.read_csv(config.OUTPUT_DIR / f"vibration_v2_features_{s}.csv")
-         for s in ["train", "val", "test"]],
-        ignore_index=True,
-    )
+    # 只用 test 段（每支錄音最後 15% 的時間）。正常基準取自 train 段，
+    # 兩者時間上不重疊，正常機台才不會變成「自己跟自己比」。與儀表板口徑相同。
+    return pd.read_csv(config.OUTPUT_DIR / "vibration_v2_features_test.csv")
 
 
 def deviation_matrix(v: pd.DataFrame, ref: dict):
@@ -145,8 +143,11 @@ def fig1(v, ref):
     j_3x = [k for k, m in enumerate(MEASURES) if m[0] == "ratio_3x_1x"][0]
     # 放在「不平衡」那列左半邊的空白格內（那兩格都是「—」），
     # 不要放到圖外，否則會壓到座標軸標籤。
+    j_1x = [k for k, m in enumerate(MEASURES) if m[0] == "order_1x_dominance"][0]
+    # 數字直接從矩陣讀，不寫死（基準或資料一改，寫死的數字就會跟圖上的格子對不上）
     ax.annotate(
-        "不平衡的 3x 偏離 2.5×\n略高於自身的 1x 2.2×\n→ 兩類互相混淆的物理來源",
+        f"不平衡的 3x 偏離 {mat[i_unb, j_3x]:.1f}×\n略高於自身的 1x {mat[i_unb, j_1x]:.1f}×"
+        "\n→ 兩類互相混淆的物理來源",
         xy=(j_3x - 0.46, i_unb), xytext=(-0.35, i_unb),
         color="#ffb4a2", fontsize=8.5, ha="left", va="center", linespacing=1.5,
         arrowprops=dict(arrowstyle="->", color="#ffb4a2", lw=1.4,
