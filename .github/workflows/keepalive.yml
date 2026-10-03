@@ -1,0 +1,64 @@
+# 讓 Streamlit Community Cloud 上的儀表板不要進入休眠。
+#
+# 為什麼不用 curl：App 休眠後，網址回傳的是一個「Yes, get this app back up!」
+# 的喚醒頁面，必須由瀏覽器真的按下按鈕才會重新啟動。curl 只會抓到那個頁面
+# 的 HTML，不會執行 JavaScript、也不會按按鈕，所以 App 其實還在睡。
+# 這裡改用無頭瀏覽器（Playwright）真的打開網頁，看到喚醒按鈕就按下去。
+
+name: Keep Streamlit App Awake
+
+on:
+  schedule:
+    # 每 6 小時一次（UTC 時間，分鐘刻意不設 0，避開 GitHub 整點排程尖峰）
+    - cron: "17 */6 * * *"
+  workflow_dispatch:   # 也可以在 GitHub 的 Actions 頁面手動按「Run workflow」
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # ⬇⬇⬇ 只要改這一行：換成你的 Streamlit 網址 ⬇⬇⬇
+      APP_URL: "https://han-1209-hackathon-2026-fa-factorypulse-preprocessingapp-d4bdrk.streamlit.app/"
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安裝無頭瀏覽器
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: 打開網站，若在休眠就按下喚醒按鈕
+        run: |
+          python - <<'PY'
+          import os, re, sys
+          from playwright.sync_api import sync_playwright
+
+          url = os.environ["APP_URL"]
+          if "請改成" in url:
+              sys.exit("請先在 keepalive.yml 把 APP_URL 改成你的 Streamlit 網址")
+
+          wake = re.compile(r"get this app back up", re.I)
+          with sync_playwright() as p:
+              page = p.chromium.launch().new_page()
+              page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+              page.wait_for_timeout(15_000)
+
+              clicked = False
+              for frame in page.frames:          # 按鈕可能在 iframe 裡
+                  btn = frame.get_by_role("button", name=wake)
+                  if btn.count():
+                      btn.first.click()
+                      clicked = True
+                      break
+
+              if clicked:
+                  print("App 原本在休眠，已按下喚醒按鈕，等待啟動…")
+                  page.wait_for_timeout(90_000)
+              else:
+                  print("App 是醒著的，停留一下讓它記錄到有人造訪")
+                  page.wait_for_timeout(20_000)
+              print("完成：", page.title())
+          PY
