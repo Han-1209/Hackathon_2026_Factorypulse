@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Generator
 
@@ -33,6 +34,33 @@ except ImportError:
 
 import knowledge_base as kb
 import evidence as ev
+
+# ── RAG 檢索器（rag_store.py）──────────────────────────────────────────
+# 全程式共用一個實例：載入索引只需要做一次，不必每換一台機台就重讀。
+# 載入失敗（例如 kb_docs/ 不存在）時為 None，追問功能照舊運作，只是沒有檢索。
+_RETRIEVER = None
+_RETRIEVER_TRIED = False
+
+
+# RAG 相關程式放在子資料夾 RAG/，加進搜尋路徑才 import 得到 rag_store
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).parent / "RAG"))
+try:
+    import rag_store as _rs
+except Exception:          # RAG/ 不存在或壞掉 → 追問功能照舊，只是沒有檢索
+    _rs = None
+
+
+def get_retriever():
+    global _RETRIEVER, _RETRIEVER_TRIED
+    if not _RETRIEVER_TRIED and _rs is not None:
+        _RETRIEVER_TRIED = True
+        try:
+            _RETRIEVER = _rs.KnowledgeRetriever()
+        except Exception:
+            _RETRIEVER = None
+    return _RETRIEVER
 
 # 模型優先順序：依序嘗試，遇到額度不足或模型下架自動切換下一個。
 #
@@ -161,12 +189,12 @@ def _build_system_prompt(diag: dict) -> str:
 並提供具體的維修建議。
 
 【嚴格限制 - 必須遵守】
-1. 你只能根據以下提供的【診斷結果】和【知識庫】內容回答問題。
+1. 僅根據以下提供的【診斷結果】和【知識庫】內容回答問題。
 2. 不可以自行編造故障原因、維修步驟、零件型號或任何診斷數據。
 3. 如果使用者問的問題與 CNC 設備維修、機械故障診斷完全無關，\
 請禮貌地拒絕，說明你只負責設備維修相關問題。
 4. 如果問題超出目前診斷資料的範圍（例如詢問你沒有資料的感測器），\
-請誠實說明資料不足，並建議進一步量測。
+請說明資料不足，並建議進一步量測。
 5. 所有的診斷判斷都來自 ML 模型和規則引擎，你不可以推翻或修改這些判斷。
 6. 用繁體中文回答，語氣專業但清晰易懂，適合現場維修工程師閱讀。
 7. 解釋「為什麼判斷成這個故障」時，必須引用下面【量測證據】裡的實際數字與頻率，\
@@ -178,6 +206,14 @@ def _build_system_prompt(diag: dict) -> str:
 不可以把它講成「可信度」「準確率」或「信心水準」。\
 若信心度等級是「中」或「低」，回答中必須明確建議複檢，不可以只講結論。
 10. 不要在回答裡使用 Markdown 的表格與程式碼區塊；粗體與清單可以用。
+11. 使用者訊息後面若附有【檢索參考資料】，那是依問題從知識庫檢索到的其他段落，\
+可能屬於「不是本次研判」的故障或風險等級說明。可以用它回答比較或假設性的問題\
+（例如「如果是不平衡要準備什麼」），但必須講明該段屬於哪一種故障，\
+絕不可以因此改變或質疑本次的研判故障。參考資料與問題無關時，直接忽略。\
+回答時不要提到「檢索參考資料」這個詞（那是系統內部用語），\
+直接說「知識庫中轉子不平衡的資料」這類說法即可。\
+若有附【檢索參考資料】，回答的最後一行必須單獨寫「〔引用：編號〕」，\
+列出你實際用到的參考編號（例如〔引用：1,3〕）；一段都沒用到就寫〔引用：無〕。
 
 【當前診斷結果】
 - 研判故障：{fault_display_name}
@@ -246,6 +282,11 @@ class LLMAssistant:
     def __init__(self, diagnosis_result: dict):
         self._diag = diagnosis_result
         self._system_prompt = _build_system_prompt(diagnosis_result)
+        # 本次研判的故障。它的完整知識庫內容已經在 system prompt 裡，
+        # 檢索時排除它，避免同樣的內容重複塞進 prompt。
+        self._fault_code = (diagnosis_result.get("fault_type")
+                            or diagnosis_result.get("probable_fault", "Normal"))
+        self.last_hits: list[dict] = []   # 最近一次追問檢索到的段落（UI 可顯示）
         self._history: list[dict] = []   # [{"role": "user"/"model", "parts": [str]}]
         self._client = None
         self._last_error: str | None = None
@@ -298,14 +339,23 @@ class LLMAssistant:
         畫面會開天窗——而 demo 當天最可能出問題的就是網路和 API 額度。
         離線摘要雖然生硬，但每個數字都是真的，該講的都有講到。
         """
+
+        # 摘要只回答「這台怎麼了、多急、先做什麼」，
+        # 細節留給下方的追問（「要準備什麼工具？」）。
         prompt = (
-            "請根據以上診斷結果，生成一份給維修工程師看的摘要報告。\n"
-            "格式：\n"
-            "1. 一句話說明目前的狀況和緊急程度\n"
-            "2. 最可能的原因（列點）\n"
-            "3. 建議立即採取的行動（列點）\n"
-            "4. 後續追蹤建議\n"
-            "語氣要像資深工程師在交班時的口頭說明，精確但不艱澀。"
+            "請寫一份交班摘要，讓現場工程師 10 秒內看完。\n"
+            "只輸出以下 4 行，每行不超過 45 個字，不要任何標題、開場白或結語：\n"
+            "**狀況**　故障名稱｜風險等級｜要不要停機、多久內處理\n"
+            "**依據**　只講最強的一項量測證據：位置、頻率、是正常的幾倍\n"
+            "**先做**　最優先的 2~3 個動作，用「、」隔開\n"
+            "**信心**　信心等級；高 → 寫一個關鍵理由；中或低 → 寫「建議複檢」與原因\n"
+            "\n"
+            "規則：\n"
+            "- 不要列工具、備品、工時、可能原因清單（使用者會在下方追問）。\n"
+            "- 不要解釋故障原理。\n"
+            "- 用工程師交班的口吻，不要用「根據」「綜上所述」「建議您」這類客套話。\n"
+            "- 數字只保留一位小數。\n"
+            "- 「先做」要和風險等級一致：危急或高風險不要寫「排程」，要寫「立即停機」或「盡快停機」。"
         )
         try:
             return self._call_llm(prompt, add_to_history=False)
@@ -319,6 +369,7 @@ class LLMAssistant:
         """
         多輪對話：使用者輸入問題，LLM 根據診斷上下文和對話歷史回答。
         """
+        self.last_hits = []
         # 粗略偵測明顯偏題（減少 API 呼叫費用）
         msg_lower = user_message.lower()
         if any(hint in msg_lower for hint in _OFF_TOPIC_HINTS):
@@ -330,18 +381,70 @@ class LLMAssistant:
             self._history.append({"role": "model", "parts": [reply]})
             return reply
 
+        # ── RAG：依問題檢索知識庫 ──
+        # 判斷問題問的是「本次研判的故障」還是「別的故障 / 風險等級」：
+        #   最相關的段落屬於本次故障 → 答案已在 system prompt 裡，不再附參考資料，
+        #                              來源只列本次故障的段落（不把其他故障的工具混進來）
+        #   最相關的段落屬於其他內容 → 把那些段落附在這一輪的訊息後面
+        hits: list[dict] = []
+        retriever = get_retriever()
+        if retriever is not None:
+            try:
+                hits = retriever.search(user_message, prefer_fault=self._fault_code)
+            except Exception:
+                hits = []      # 檢索失敗不影響回答，LLM 仍有 system prompt 裡的知識庫
+        about_current = bool(hits) and hits[0].get("fault_code") == self._fault_code
+        if about_current:
+            hits = [h for h in hits if h.get("fault_code") == self._fault_code]
+            inject = []
+        else:
+            hits = [h for h in hits if h.get("fault_code") != self._fault_code]
+            inject = hits
+        self.last_hits = hits
+        context = _rs.format_for_llm(inject) if inject else None
+
         try:
-            return self._call_llm(user_message, add_to_history=True)
+            reply = self._call_llm(user_message, add_to_history=True, context=context)
         except Exception as e:
             # 追問失敗時不能只丟一句「錯誤」，至少把手上的證據交出去，
             # 讓使用者還是能看到這台設備的量測數據。
             self._last_error = str(e)
+            # 有檢索到段落的話，離線時直接把原文交出去 —— 不經 LLM，但仍然回答得了問題。
+            retrieved = ""
+            if hits:
+                retrieved = ("以下為知識庫中與你的問題最相關的段落：\n\n"
+                             + "\n\n".join(f"**{h['title']}**\n{h['text'].partition(chr(10))[2]}"
+                                             for h in hits) + "\n\n---\n\n")
             return (
                 "（LLM 服務目前無法連線，以下為離線的診斷資料）\n\n"
+                + retrieved
                 + ev.fallback_summary(self._diag, self._evidence())
             )
 
-    def _call_llm(self, message: str, add_to_history: bool) -> str:
+        # ── 來源標示 ──
+        # 📚 要列的是「LLM 實際用到的段落」，不是「檢索到的段落」。
+        # 實測只靠相似度分數過濾不可靠：問「高風險要多快處理」，警告等級那段只低 0.02 分
+        # 也被列出；問不平衡的工具，LLM 用了安全注意事項，來源卻沒列。
+        # 所以請 LLM 在最後一行回報〔引用：1,3〕，程式解析後再刪掉這行。
+        sources = ""
+        if inject:
+            m = re.search(r"〔引用[:：]\s*([^〕]*)〕\s*$", reply)
+            if m:
+                reply = reply[:m.start()].rstrip()
+                nums = {int(x) for x in re.findall(r"\d+", m.group(1))}
+                used = [h for n, h in enumerate(inject, 1) if n in nums]
+                sources = _rs.format_sources(used, trusted=True)
+            else:                # LLM 忘了回報 → 退回用分數判斷
+                sources = _rs.format_sources(inject)
+            if self._history and self._history[-1]["role"] == "model":
+                self._history[-1]["parts"] = [reply]   # 對話紀錄也不要留〔引用〕那行
+        elif hits:
+            # 問的是本次故障：答案來自 system prompt，只標最相關的一段
+            sources = _rs.format_sources(hits[:1])
+        return reply + sources
+
+    def _call_llm(self, message: str, add_to_history: bool,
+                  context: str | None = None) -> str:
         """呼叫 Gemini API，回傳文字回應。
 
         遇到 429 額度耗盡時會自動：
@@ -359,9 +462,11 @@ class LLMAssistant:
                     parts=[types.Part(text=p) for p in turn["parts"]],
                 )
             )
-        # 加上當前訊息
+        # 加上當前訊息。檢索到的參考資料只附在「這一輪」送出，
+        # 對話歷史只存使用者原話 —— 否則每問一次 prompt 就多好幾段，越聊越長越貴。
         contents.append(
-            types.Content(role="user", parts=[types.Part(text=message)])
+            types.Content(role="user",
+                          parts=[types.Part(text=message + (context or ""))])
         )
 
         config = types.GenerateContentConfig(
