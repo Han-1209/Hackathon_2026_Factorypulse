@@ -81,6 +81,9 @@ _MODEL_CANDIDATES = [
     "gemini-flash-latest",     # 別名保險，永遠指向可用的最新 flash
 ]
 
+# LLM 回報引用的標記，例如〔引用：1,3〕。程式解析後刪除，不給使用者看。
+_CITE_RE = re.compile(r"\s*〔引用[:：]\s*([^〕]*)〕\s*")
+
 # 重試設定
 _MAX_RETRIES = 3
 _RETRY_BASE_DELAY = 12  # 秒（Google 建議 10 秒後重試）
@@ -345,7 +348,7 @@ class LLMAssistant:
         prompt = (
             "請寫一份交班摘要，讓現場工程師 10 秒內看完。\n"
             "只輸出以下 4 行，每行不超過 45 個字，不要任何標題、開場白或結語：\n"
-            "**狀況**　故障名稱｜風險等級｜要不要停機、多久內處理\n"
+            "**狀況**　故障名稱｜風險等級｜處置時限（例如「盡快停機」「72 小時內檢查」，不要寫「是／否」）\n"
             "**依據**　只講最強的一項量測證據：位置、頻率、是正常的幾倍\n"
             "**先做**　最優先的 2~3 個動作，用「、」隔開\n"
             "**信心**　信心等級；高 → 寫一個關鍵理由；中或低 → 寫「建議複檢」與原因\n"
@@ -358,7 +361,9 @@ class LLMAssistant:
             "- 「先做」要和風險等級一致：危急或高風險不要寫「排程」，要寫「立即停機」或「盡快停機」。"
         )
         try:
-            return self._call_llm(prompt, add_to_history=False)
+            # 摘要沒有附檢索資料，但 LLM 偶爾仍會照 system prompt 規則 11 寫〔引用：無〕，
+            # 一律刪掉，不讓系統內部標記出現在畫面上。
+            return _CITE_RE.sub("", self._call_llm(prompt, add_to_history=False)).rstrip()
         except Exception as e:
             self._last_error = str(e)
             if not allow_fallback:
@@ -428,7 +433,7 @@ class LLMAssistant:
         # 所以請 LLM 在最後一行回報〔引用：1,3〕，程式解析後再刪掉這行。
         sources = ""
         if inject:
-            m = re.search(r"〔引用[:：]\s*([^〕]*)〕\s*$", reply)
+            m = _CITE_RE.search(reply)
             if m:
                 reply = reply[:m.start()].rstrip()
                 nums = {int(x) for x in re.findall(r"\d+", m.group(1))}
@@ -441,6 +446,10 @@ class LLMAssistant:
         elif hits:
             # 問的是本次故障：答案來自 system prompt，只標最相關的一段
             sources = _rs.format_sources(hits[:1])
+        # 沒附參考資料時 LLM 也可能寫〔引用：無〕，同樣刪掉
+        reply = _CITE_RE.sub("", reply).rstrip()
+        if self._history and self._history[-1]["role"] == "model":
+            self._history[-1]["parts"] = [reply]
         return reply + sources
 
     def _call_llm(self, message: str, add_to_history: bool,
